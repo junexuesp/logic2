@@ -1,0 +1,13 @@
+{
+  "name": "esp_data",
+  "apiVersion": "1.0.0",
+  "author": "june",
+  "version": "0.0.1",
+  "description": "esp ble data signal extract",
+  "extensions": {
+    "esp_data": {
+      "type": "HighLevelAnalyzer",
+      "entryPoint": "HighLevelAnalyzer.Hla"
+    }
+  }
+}
