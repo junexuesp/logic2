@@ -105,6 +105,11 @@ class Hla(HighLevelAnalyzer):
                 frame_type = 'pld:'
             
             end_time_f = self.end_time
+            
+            if self.end_time - self.start_time > self.byte_period + self.byte_period:
+                end_time_f = self.start_time + self.byte_period
+                # Means a new frame
+                self.analyze_st = 1
             # Create a new output frame with the same start and end time as the last input frame
             
             new_frame = AnalyzerFrame(frame_type, self.start_time, end_time_f, {
@@ -118,11 +123,6 @@ class Hla(HighLevelAnalyzer):
                 new_frame.data['md_cie'] = self.md_cie
                 new_frame.data['cp_rfu'] = self.cp_rfu
                 new_frame.data['npi_rfu'] = self.rfu_npi
-            if self.end_time - self.start_time > self.byte_period*2:
-                end_time_f = self.start_time + self.byte_period
-                # Means a new frame
-                self.analyze_st = 1
-            
             # Convert the self.byte variable to a byte object
             byte_data = bytes([self.byte])
             # Add the self.byte variable as the data field of the output frame
