@@ -17,6 +17,7 @@ import time
 pdutype = ['ADV_IND', 'ADV_DIR', 'NON_CONN', 'SCAN_REQ', 'CONN_IND', 'SCAN_IND', 'EXT_ADV', 'AUX_CONN_RSP']
 acl_llid_type = ['RFU', 'EMP_CONTINUE', 'START_COM', 'CONTROL']
 iso_llid_type = ['UNF_COM_END', 'UNF_START_CON', 'FRAMED_PDU', 'CTRL_PDU']
+byte_rate_time = [8, 4, 64, 16]
 # High level analyzers must subclass the HighLevelAnalyzer class.
 class Hla(HighLevelAnalyzer):
     # List of settings that a user can set for this High Level Analyzer.
@@ -41,10 +42,9 @@ class Hla(HighLevelAnalyzer):
         self.byte = 0
         self.count = 0
         self.frame_start_time = 0
-        self.end_time = 0
-        self.byte_start_time_ns = 0
         self.analyze_st = "WAIT_S0"
-        self.byte_period_ns = 0
+        self.rate = 0
+        self.frame_len = 0
 
         print("Settings:", self.my_string_setting,
               self.my_number_setting, self.my_choices_setting, self.frame_start_time)
@@ -58,6 +58,7 @@ class Hla(HighLevelAnalyzer):
         if self.analyze_st == "WAIT_S0":
             self.analyze_st = "WAIT_LEN"
         elif self.analyze_st == "WAIT_LEN":
+            self.frame_len = self.byte
             self.analyze_st = "WAIT_PLD"
     # API to process timeout frames
     def process_state(self, frame: AnalyzerFrame):
@@ -71,7 +72,14 @@ class Hla(HighLevelAnalyzer):
             self.bit_time_error = 0
             if self.count == 0:
                 self.frame_start_time = frame.start_time
-                self.byte_period_ns = delta_st*8
+                if delta_st < 4000:
+                    self.rate = 1
+                elif delta_st <8000:
+                    self.rate = 0
+                elif delta_st < 16000:
+                    self.rate = 3
+                else:
+                    self.rate = 2
     # API to return frame type info
     def get_frame_type(self):
         if self.analyze_st == "WAIT_S0":
@@ -111,9 +119,8 @@ class Hla(HighLevelAnalyzer):
             new_frame.data['rfu'] = (self.byte>>6)&3
     # API to display timeout byte             
     def show_byte_tmo(self, frame: AnalyzerFrame):
-        self.end_time = frame.end_time
         frame_type = self.get_frame_type()
-        deltass = SaleaeTimeDelta(microsecond=8)
+        deltass = SaleaeTimeDelta(microsecond=byte_rate_time[self.rate])
         end_time_f = self.frame_start_time + deltass
         # Create a new output frame with the same start and end time as the last input frame
         new_frame = AnalyzerFrame(frame_type, self.frame_start_time, end_time_f, {
@@ -129,15 +136,12 @@ class Hla(HighLevelAnalyzer):
         # Reset the self.byte and self.count variables to 0
         self.byte = 0
         self.count = 0
-        self.byte_start_time_ns = 0
         # Means a new frame
         self.analyze_st = "WAIT_S0"
-        # self.byte_period_ns = 0
         return new_frame
 
     # show byte frame
     def show_byte(self, frame: AnalyzerFrame):
-        self.end_time = frame.end_time
         frame_type = self.get_frame_type()
         # Create a new output frame with the same start and end time as the last input frame
         new_frame = AnalyzerFrame(frame_type, self.frame_start_time, frame.end_time, {
@@ -150,12 +154,11 @@ class Hla(HighLevelAnalyzer):
         byte_data = bytes([self.byte])
         # Add the self.byte variable as the data field of the output frame
         new_frame.data['data'] = byte_data
+        #update state machine
+        self.analyze_state_change()
         # Reset the self.byte and self.count variables to 0
         self.byte = 0
         self.count = 0
-        self.byte_start_time_ns = 0
-        self.analyze_state_change()
-        # self.byte_period_ns = 0
         return new_frame
 
     def decode(self, frame: AnalyzerFrame):
