@@ -42,9 +42,12 @@ class Hla(HighLevelAnalyzer):
         self.byte = 0
         self.count = 0
         self.frame_start_time = 0
+        self.pld_frame_start_time = 0
         self.analyze_st = "WAIT_S0"
         self.rate = 0
         self.frame_len = 0
+        self.frame_len_remain = 0
+        self.pld = []
 
         print("Settings:", self.my_string_setting,
               self.my_number_setting, self.my_choices_setting, self.frame_start_time)
@@ -59,24 +62,37 @@ class Hla(HighLevelAnalyzer):
             self.analyze_st = "WAIT_LEN"
         elif self.analyze_st == "WAIT_LEN":
             self.frame_len = self.byte
-            self.analyze_st = "WAIT_PLD"
+            self.frame_len_remain  = self.byte
+            if self.frame_len == 0:
+                self.frame_len = 3
+                self.frame_len_remain  = 3
+                self.analyze_st = "WAIT_CRC"
+            else:
+                self.analyze_st = "WAIT_PLD"
+        elif self.analyze_st == "WAIT_PLD":
+            self.frame_len = 3
+            self.frame_len_remain  = 3
+            self.analyze_st = "WAIT_CRC"
+        else:
+            self.analyze_st = "WAIT_S0"
     # API to process timeout frames
     def process_state(self, frame: AnalyzerFrame):
         delta_st = self.delat_to_ns(frame.end_time, frame.start_time)
         #means bit duration error
         if delta_st > 8000:
             self.bit_time_error = 1
-        elif delta_st < 400 and self.count != 7:
+        elif delta_st < 200 and self.count != 7:
+            print("tmo")
             self.bit_time_error = 2
         else:
             self.bit_time_error = 0
             if self.count == 0:
                 self.frame_start_time = frame.start_time
-                if delta_st < 4000:
+                if delta_st < 500:
                     self.rate = 1
-                elif delta_st <8000:
+                elif delta_st <1000:
                     self.rate = 0
-                elif delta_st < 16000:
+                elif delta_st < 2000:
                     self.rate = 3
                 else:
                     self.rate = 2
@@ -86,8 +102,10 @@ class Hla(HighLevelAnalyzer):
             frame_type = 's0'
         elif self.analyze_st == "WAIT_LEN":
             frame_type = 'len'
-        else:
+        elif self.analyze_st == "WAIT_PLD":
             frame_type = 'pld'
+        else:
+            frame_type = 'crc'
         return frame_type
     # API to set s0 fields
     def set_s0_fields(self, new_frame: AnalyzerFrame):
@@ -117,48 +135,66 @@ class Hla(HighLevelAnalyzer):
             new_frame.data['cssn'] = (self.byte>>2)&7
             new_frame.data['cstf'] = (self.byte>>5)&1
             new_frame.data['rfu'] = (self.byte>>6)&3
-    # API to display timeout byte             
-    def show_byte_tmo(self, frame: AnalyzerFrame):
-        frame_type = self.get_frame_type()
-        deltass = SaleaeTimeDelta(microsecond=byte_rate_time[self.rate])
-        end_time_f = self.frame_start_time + deltass
-        # Create a new output frame with the same start and end time as the last input frame
-        new_frame = AnalyzerFrame(frame_type, self.frame_start_time, end_time_f, {
-            'data': "byte"
-        })
-
-        if self.analyze_st == "WAIT_S0":
-            self.set_s0_fields(new_frame)
-        # Convert the self.byte variable to a byte object
-        byte_data = bytes([self.byte])
-        # Add the self.byte variable as the data field of the output frame
-        new_frame.data['data'] = byte_data
-        # Reset the self.byte and self.count variables to 0
-        self.byte = 0
-        self.count = 0
-        # Means a new frame
-        self.analyze_st = "WAIT_S0"
-        return new_frame
 
     # show byte frame
-    def show_byte(self, frame: AnalyzerFrame):
-        frame_type = self.get_frame_type()
-        # Create a new output frame with the same start and end time as the last input frame
-        new_frame = AnalyzerFrame(frame_type, self.frame_start_time, frame.end_time, {
-            'data': "byte"
-        })
-
-        if self.analyze_st == "WAIT_S0":
-            self.set_s0_fields(new_frame)
+    def show_byte(self, frame: AnalyzerFrame, tmo):
         # Convert the self.byte variable to a byte object
         byte_data = bytes([self.byte])
-        # Add the self.byte variable as the data field of the output frame
-        new_frame.data['data'] = byte_data
-        #update state machine
-        self.analyze_state_change()
+        show_frame = 0
+        new_frame = 0
+        if self.analyze_st == "WAIT_PLD" or self.analyze_st == "WAIT_CRC":
+            self.pld.append(self.byte)
+            # print("***:",self.pld)
+            if self.frame_len != 0:
+                if self.frame_len_remain == self.frame_len:
+                    self.pld_frame_start_time = self.frame_start_time
+                self.frame_len_remain -= 1
+                if self.frame_len_remain == 0 or tmo == 1:
+                    show_frame = 1
+                else:
+                    self.byte = 0
+                    self.count = 0
+                    return
+            else:
+                show_frame = 1
+                self.pld_frame_start_time = self.frame_start_time
+        else:
+            show_frame = 1
+        end_time_f = frame.end_time
+        if tmo == 1:
+            deltass = SaleaeTimeDelta(microsecond=byte_rate_time[self.rate])
+            end_time_f = self.frame_start_time + deltass
+        if show_frame == 1:
+            frame_type = self.get_frame_type()
+            if self.analyze_st == "WAIT_PLD" or self.analyze_st == "WAIT_CRC":
+                pld_hex = list(map(hex, self.pld))
+                # Create a new output frame with the same start and end time as the last input frame
+                new_frame = AnalyzerFrame(frame_type, self.pld_frame_start_time, end_time_f, {
+                    'data': str(pld_hex)
+                })
+                
+                # Add the self.byte variable as the data field of the output frame
+                # new_frame.data['data'] = str(pld_hex)
+                # print("hex:",str(pld_hex))
+                self.pld.clear()
+                self.frame_len = 0
+                self.frame_len_remain = 0
+            else:
+                # Create a new output frame with the same start and end time as the last input frame
+                new_frame = AnalyzerFrame(frame_type, self.frame_start_time, end_time_f, {
+                    'data': "byte"
+                })
+                if self.analyze_st == "WAIT_S0":
+                    self.set_s0_fields(new_frame)
+                # Add the self.byte variable as the data field of the output frame
+                new_frame.data['data'] = byte_data
+            #update state machine
+            self.analyze_state_change()
         # Reset the self.byte and self.count variables to 0
         self.byte = 0
         self.count = 0
+        if tmo == 1:
+            self.analyze_st = "WAIT_S0"
         return new_frame
 
     def decode(self, frame: AnalyzerFrame):
@@ -171,10 +207,15 @@ class Hla(HighLevelAnalyzer):
 
         # Get the data from the input frame
         data = frame.data['data']
-        byte_timeout = 0
         # if bit time duration error
         if self.bit_time_error == 1:
-            return self.show_byte_tmo(frame)
+            # Shift the self.byte variable to the left by one bit
+            data = data << self.count
+            # Or the self.byte variable with the data
+            self.byte = self.byte | data
+            # Increment the self.count variable by one
+            self.count = self.count + 1
+            return self.show_byte(frame, 1)
         elif self.bit_time_error == 2:
             return
         # Shift the self.byte variable to the left by one bit
@@ -185,6 +226,6 @@ class Hla(HighLevelAnalyzer):
         self.count = self.count + 1
         # Check if we have received 8 input frames
         if self.count == 8:
-            new_frame = self.show_byte(frame)
+            new_frame = self.show_byte(frame, 0)
             # Return the output frame to Logic 2 software
             return new_frame
