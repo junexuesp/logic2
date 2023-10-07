@@ -4,7 +4,7 @@
 from saleae.analyzers import HighLevelAnalyzer, AnalyzerFrame, StringSetting, NumberSetting, ChoicesSetting
 
 # 从saleae.data模块中导入SaleaeTimeDelta类
-from saleae.data import SaleaeTimeDelta
+from saleae.data import SaleaeTime, SaleaeTimeDelta
 
 from saleae.data import GraphTime
 
@@ -17,7 +17,7 @@ import time
 pdutype = ['ADV_IND', 'ADV_DIR', 'NON_CONN', 'SCAN_REQ', 'CONN_IND', 'SCAN_IND', 'EXT_ADV', 'AUX_CONN_RSP']
 acl_llid_type = ['RFU', 'EMP_CONTINUE', 'START_COM', 'CONTROL']
 iso_llid_type = ['UNF_COM_END', 'UNF_START_CON', 'FRAMED_PDU', 'CTRL_PDU']
-byte_rate_time = [8, 4, 64, 16]
+bit_rate_time = [1, 0.5, 8, 2]
 # High level analyzers must subclass the HighLevelAnalyzer class.
 class Hla(HighLevelAnalyzer):
     # List of settings that a user can set for this High Level Analyzer.
@@ -78,24 +78,25 @@ class Hla(HighLevelAnalyzer):
     # API to process timeout frames
     def process_state(self, frame: AnalyzerFrame):
         delta_st = self.delat_to_ns(frame.end_time, frame.start_time)
+        #init the frame start time
+        if self.frame_start_time == 0:
+            self.frame_start_time = frame.start_time
+            # self.frame_start_time = frame.start_time
+            if delta_st < 500:
+                self.rate = 1
+            elif delta_st <1000:
+                self.rate = 0
+            elif delta_st < 2000:
+                self.rate = 3
+            else:
+                self.rate = 2
         #means bit duration error
         if delta_st > 8000:
             self.bit_time_error = 1
         elif delta_st < 200 and self.count != 7:
-            print("tmo")
             self.bit_time_error = 2
         else:
             self.bit_time_error = 0
-            if self.count == 0:
-                self.frame_start_time = frame.start_time
-                if delta_st < 500:
-                    self.rate = 1
-                elif delta_st <1000:
-                    self.rate = 0
-                elif delta_st < 2000:
-                    self.rate = 3
-                else:
-                    self.rate = 2
     # API to return frame type info
     def get_frame_type(self):
         if self.analyze_st == "WAIT_S0":
@@ -154,6 +155,7 @@ class Hla(HighLevelAnalyzer):
                 else:
                     self.byte = 0
                     self.count = 0
+                    self.frame_start_time = 0
                     return
             else:
                 show_frame = 1
@@ -162,8 +164,8 @@ class Hla(HighLevelAnalyzer):
             show_frame = 1
         end_time_f = frame.end_time
         if tmo == 1:
-            deltass = SaleaeTimeDelta(microsecond=byte_rate_time[self.rate])
-            end_time_f = self.frame_start_time + deltass
+            deltass = SaleaeTimeDelta(microsecond=bit_rate_time[self.rate])
+            end_time_f = frame.start_time + deltass
         if show_frame == 1:
             frame_type = self.get_frame_type()
             if self.analyze_st == "WAIT_PLD" or self.analyze_st == "WAIT_CRC":
@@ -181,6 +183,7 @@ class Hla(HighLevelAnalyzer):
                 self.frame_len_remain = 0
             else:
                 # Create a new output frame with the same start and end time as the last input frame
+                # print("start: , end: ,", self.frame_start_time, end_time_f, self.count)
                 new_frame = AnalyzerFrame(frame_type, self.frame_start_time, end_time_f, {
                     'data': "byte"
                 })
@@ -193,6 +196,7 @@ class Hla(HighLevelAnalyzer):
         # Reset the self.byte and self.count variables to 0
         self.byte = 0
         self.count = 0
+        self.frame_start_time = 0
         if tmo == 1:
             self.analyze_st = "WAIT_S0"
         return new_frame
