@@ -14,7 +14,7 @@ import binascii
 # Import the time module
 import time
 
-pdutype = ['ADV_IND', 'ADV_DIR', 'NON_CONN', 'SCAN_REQ', 'CONN_IND', 'SCAN_IND', 'EXT_ADV', 'AUX_CONN_RSP']
+pdutype = ['ADV_IND', 'ADV_DIR', 'NON_CONN', 'SCAN_REQ', 'SCAN_RSP', 'CONN_IND', 'SCAN_IND', 'EXT_ADV', 'AUX_CONN_RSP']
 acl_llid_type = ['RFU', 'EMP_CONTINUE', 'START_COM', 'CONTROL']
 iso_llid_type = ['UNF_COM_END', 'UNF_START_CON', 'FRAMED_PDU', 'CTRL_PDU']
 bit_rate_time = [1, 0.5, 8, 2]
