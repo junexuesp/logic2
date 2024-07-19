@@ -126,7 +126,11 @@ class Hla(HighLevelAnalyzer):
             new_frame.data['npi'] = (self.byte>>6)&1
             new_frame.data['rfu'] = (self.byte>>7)&1
         elif self.my_choices_setting == "ADV":
-            new_frame.data['pdu_type'] = pdutype[self.byte&0x7]
+            adv_pdu_type = self.byte&0xf
+            if adv_pdu_type > 8:
+                new_frame.data['pdu_type'] = "INVALID"
+            else:
+                new_frame.data['pdu_type'] = pdutype[self.byte&0xf]
             new_frame.data['rfu'] = (self.byte>>4)&1
             new_frame.data['chsel'] = (self.byte>>5)&1
             new_frame.data['TxAdd'] = (self.byte>>6)&1
