@@ -6,20 +6,9 @@ from saleae.analyzers import HighLevelAnalyzer, AnalyzerFrame, StringSetting, Nu
 # Import SaleaeTimeDelta for time calculations
 from saleae.data import SaleaeTimeDelta
 
-# BLE PDU types for advertising channels
-pdutype = ['ADV_IND', 'ADV_DIR', 'NON_CONN', 'SCAN_REQ', 'SCAN_RSP', 'CONN_IND', 'SCAN_IND', 'EXT_ADV', 'AUX_CONN_RSP']
-
-# ACL (Asynchronous Connection-Less) Link Layer ID types
-acl_llid_type = ['RFU', 'EMP_CONTINUE', 'START_COM', 'CONTROL']
-
-# ISO (Isochronous) Link Layer ID types
-iso_llid_type = ['UNF_COM_END', 'UNF_START_CON', 'FRAMED_PDU', 'CTRL_PDU']
-
-# Bit rate timing in microseconds: [1Mbps, 2Mbps, 500Kbps, 125Kbps]
-bit_rate_time = [1, 0.5, 8, 2]
-
-# Extended Advertising Mode types
-ext_adv_mode = ['LEGACY', 'NON_CONNECTABLE', 'SCANNABLE', 'CONNECTABLE']
+# Import constants and parsers
+from constants import PDU_TYPE, BIT_RATE_TIME
+from parsers import adv_parser, acl_parser, cis_parser, bis_parser
 # High level analyzers must subclass the HighLevelAnalyzer class.
 class Hla(HighLevelAnalyzer):
     # List of settings that a user can set for this High Level Analyzer.
@@ -209,38 +198,19 @@ class Hla(HighLevelAnalyzer):
             new_frame: AnalyzerFrame to populate with parsed fields
         """
         if self.my_choices_setting == "ACL":
-            # ACL (Asynchronous Connection-Less) link type
-            new_frame.data['llid'] = acl_llid_type[self.byte & 3]  # Bits 0-1: LLID
-            new_frame.data['nesn'] = (self.byte >> 2) & 1  # Bit 2: Next Expected Sequence Number
-            new_frame.data['sn'] = (self.byte >> 3) & 1  # Bit 3: Sequence Number
-            new_frame.data['md'] = (self.byte >> 4) & 1  # Bit 4: More Data
-            new_frame.data['cp'] = (self.byte >> 5) & 1  # Bit 5: Control PDU
-            new_frame.data['rfu'] = (self.byte >> 6) & 1  # Bit 6: Reserved for Future Use
+            parsed = acl_parser.parse_s0_acl(self.byte)
+            new_frame.data.update(parsed)
         elif self.my_choices_setting == "CIS":
-            # CIS (Connected Isochronous Stream) link type
-            new_frame.data['llid'] = iso_llid_type[self.byte & 3]  # Bits 0-1: LLID
-            new_frame.data['nesn'] = (self.byte >> 2) & 1  # Bit 2: Next Expected Sequence Number
-            new_frame.data['sn'] = (self.byte >> 3) & 1  # Bit 3: Sequence Number
-            new_frame.data['cie'] = (self.byte >> 4) & 1  # Bit 4: CIS Event
-            new_frame.data['rfu'] = (self.byte >> 5) & 1  # Bit 5: Reserved for Future Use
-            new_frame.data['npi'] = (self.byte >> 6) & 1  # Bit 6: NSE Payload Indicator
-            new_frame.data['rfu'] = (self.byte >> 7) & 1  # Bit 7: Reserved for Future Use
+            parsed = cis_parser.parse_s0_cis(self.byte)
+            new_frame.data.update(parsed)
         elif self.my_choices_setting == "ADV":
-            # ADV (Advertising) link type
-            pdu_type_idx = self.byte & 0x7  # Bits 0-2: PDU Type
-            new_frame.data['pdu_type'] = pdutype[pdu_type_idx]
+            parsed = adv_parser.parse_s0_adv(self.byte)
+            new_frame.data.update(parsed)
             # Save PDU type for EXT_ADV special handling
-            self.pdu_type = pdutype[pdu_type_idx]
-            new_frame.data['rfu'] = (self.byte >> 4) & 1  # Bit 4: Reserved for Future Use
-            new_frame.data['chsel'] = (self.byte >> 5) & 1  # Bit 5: Channel Selection
-            new_frame.data['TxAdd'] = (self.byte >> 6) & 1  # Bit 6: Transmit Address
-            new_frame.data['RxAdd'] = (self.byte >> 7) & 1  # Bit 7: Receive Address
-        else:
-            # BIS (Broadcast Isochronous Stream) link type
-            new_frame.data['llid'] = iso_llid_type[self.byte & 3]  # Bits 0-1: LLID
-            new_frame.data['cssn'] = (self.byte >> 2) & 7  # Bits 2-4: CIS Subevent Sequence Number
-            new_frame.data['cstf'] = (self.byte >> 5) & 1  # Bit 5: CIS Subevent Time Flag
-            new_frame.data['rfu'] = (self.byte >> 6) & 3  # Bits 6-7: Reserved for Future Use
+            self.pdu_type = parsed['pdu_type']
+        else:  # BIS
+            parsed = bis_parser.parse_s0_bis(self.byte)
+            new_frame.data.update(parsed)
 
     def set_ceap_fields(self, new_frame: AnalyzerFrame):
         """
@@ -253,35 +223,18 @@ class Hla(HighLevelAnalyzer):
         Args:
             new_frame: AnalyzerFrame to populate with parsed fields
         """
-        self.ext_hdr_len = self.byte & 0x3F  # Bits 0-5: Extended Header Length (0-63 bytes)
-        adv_mode_idx = (self.byte >> 6) & 0x3  # Bits 6-7: Advertising Mode
-        new_frame.data['ext_hdr_len'] = self.ext_hdr_len
-        new_frame.data['adv_mode'] = ext_adv_mode[adv_mode_idx]
-        # Adjust remaining payload length (CEAP header is part of payload)
-        if self.frame_len_remain > 0:
-            self.frame_len_remain -= 1
+        parsed, ext_hdr_len, new_frame_len_remain = adv_parser.parse_ceap_fields(
+            self.byte, self.frame_len_remain
+        )
+        new_frame.data.update(parsed)
+        self.ext_hdr_len = ext_hdr_len
+        self.frame_len_remain = new_frame_len_remain
 
     def parse_extended_header(self, ext_hdr_bytes):
         """
         Parse Extended Header fields based on flags (BLE 6.0 specification).
         
-        Extended Header structure (BLE 6.0):
-        - Flags (1 byte): Indicates which fields are present
-          - Bit 0: AdvA present
-          - Bit 1: TargetA present
-          - Bit 2: CTEInfo present
-          - Bit 3: ADI (Advertising Data Indication) present
-          - Bit 4: AuxPtr present
-          - Bit 5: SyncInfo present
-          - Bit 6: TxPower present
-          - Bit 7: RFU
-        - AdvA (6 bytes): Advertiser's address (if Flags bit 0 set)
-        - TargetA (6 bytes): Target address (if Flags bit 1 set)
-        - CTEInfo (1 byte): Constant Tone Extension Info (if Flags bit 2 set)
-        - ADI (2 bytes): Advertising Data Indication (if Flags bit 3 set)
-        - AuxPtr (3 bytes): Auxiliary Pointer (if Flags bit 4 set)
-        - SyncInfo (18 bytes): Synchronization Info (if Flags bit 5 set)
-        - TxPower (1 byte): Transmit Power (if Flags bit 6 set)
+        Delegates to adv_parser module.
         
         Args:
             ext_hdr_bytes: List of bytes in the extended header
@@ -289,118 +242,22 @@ class Hla(HighLevelAnalyzer):
         Returns:
             dict: Parsed extended header fields
         """
-        if len(ext_hdr_bytes) == 0:
-            return {}
+        return adv_parser.parse_extended_header(ext_hdr_bytes)
+
+    def parse_adv_payload(self, pdu_type, payload_bytes):
+        """
+        Parse BLE 4.2 advertising packet payload according to PDU type.
         
-        parsed = {}
-        idx = 0
+        Delegates to adv_parser module.
         
-        # Parse Flags (first byte)
-        if idx < len(ext_hdr_bytes):
-            flags = ext_hdr_bytes[idx]
-            parsed['flags'] = flags
-            parsed['adv_a_present'] = (flags & 0x01) != 0  # Bit 0
-            parsed['target_a_present'] = (flags & 0x02) != 0  # Bit 1
-            parsed['cte_info_present'] = (flags & 0x04) != 0  # Bit 2
-            parsed['adi_present'] = (flags & 0x08) != 0  # Bit 3
-            parsed['aux_ptr_present'] = (flags & 0x10) != 0  # Bit 4
-            parsed['sync_info_present'] = (flags & 0x20) != 0  # Bit 5
-            parsed['tx_power_present'] = (flags & 0x40) != 0  # Bit 6
-            parsed['rfu'] = (flags >> 7) & 0x1  # Bit 7
-            idx += 1
+        Args:
+            pdu_type: PDU type string (e.g., 'ADV_IND', 'SCAN_REQ')
+            payload_bytes: List of payload bytes
             
-            # Parse AdvA (6 bytes) if present
-            if parsed['adv_a_present'] and idx + 6 <= len(ext_hdr_bytes):
-                adv_a_bytes = ext_hdr_bytes[idx:idx+6]
-                # Convert to little-endian MAC address format
-                adv_a_str = ':'.join(f'{b:02X}' for b in reversed(adv_a_bytes))
-                parsed['adv_a'] = adv_a_str
-                idx += 6
-            
-            # Parse TargetA (6 bytes) if present
-            if parsed['target_a_present'] and idx + 6 <= len(ext_hdr_bytes):
-                target_a_bytes = ext_hdr_bytes[idx:idx+6]
-                target_a_str = ':'.join(f'{b:02X}' for b in reversed(target_a_bytes))
-                parsed['target_a'] = target_a_str
-                idx += 6
-            
-            # Parse CTEInfo (1 byte) if present
-            if parsed['cte_info_present'] and idx < len(ext_hdr_bytes):
-                cte_info_byte = ext_hdr_bytes[idx]
-                # CTEInfo: Bits 0-4 = CTE Length, Bit 5 = RFU, Bits 6-7 = CTE Type
-                cte_length = cte_info_byte & 0x1F  # Bits 0-4
-                cte_rfu = (cte_info_byte >> 5) & 0x1  # Bit 5
-                cte_type = (cte_info_byte >> 6) & 0x3  # Bits 6-7
-                parsed['cte_info'] = {
-                    'cte_length': cte_length,
-                    'cte_rfu': cte_rfu,
-                    'cte_type': cte_type
-                }
-                idx += 1
-            
-            # Parse ADI (2 bytes) if present
-            if parsed['adi_present'] and idx + 2 <= len(ext_hdr_bytes):
-                adi_bytes = ext_hdr_bytes[idx:idx+2]
-                # ADI: Advertising Data Indication (2 bytes)
-                adi = adi_bytes[0] | (adi_bytes[1] << 8)
-                parsed['adi'] = adi
-                idx += 2
-            
-            # Parse AuxPtr (3 bytes) if present
-            if parsed['aux_ptr_present'] and idx + 3 <= len(ext_hdr_bytes):
-                aux_ptr = ext_hdr_bytes[idx:idx+3]
-                # AuxPtr: Channel Index (1 byte) + CA (1 byte) + Offset (1 byte)
-                channel_idx = aux_ptr[0]
-                ca = aux_ptr[1]
-                offset = aux_ptr[2]
-                parsed['aux_ptr'] = {
-                    'channel_idx': channel_idx,
-                    'ca': ca,
-                    'offset': offset
-                }
-                idx += 3
-            
-            # Parse SyncInfo (18 bytes) if present
-            if parsed['sync_info_present'] and idx + 18 <= len(ext_hdr_bytes):
-                sync_info = ext_hdr_bytes[idx:idx+18]
-                # SyncInfo: Access Address (4 bytes) + CRCInit (3 bytes) + 
-                #          WinOffset (2 bytes) + WinSize (1 byte) + Interval (2 bytes) +
-                #          Channel Map (5 bytes) + Hop/SCA/RFU (1 byte)
-                access_addr = sync_info[0:4]
-                crc_init = sync_info[4:7]
-                win_offset = sync_info[7] | (sync_info[8] << 8)
-                win_size = sync_info[9]
-                interval = sync_info[10] | (sync_info[11] << 8)
-                channel_map = sync_info[12:17]
-                hop_byte = sync_info[17]
-                # Hop byte: Bits 0-2 = Hop, Bits 3-5 = SCA, Bits 6-7 = RFU
-                hop = hop_byte & 0x7
-                sca = (hop_byte >> 3) & 0x7
-                rfu = (hop_byte >> 6) & 0x3
-                
-                parsed['sync_info'] = {
-                    'access_addr': ':'.join(f'{b:02X}' for b in reversed(access_addr)),
-                    'crc_init': ':'.join(f'{b:02X}' for b in reversed(crc_init)),
-                    'win_offset': win_offset,
-                    'win_size': win_size,
-                    'interval': interval,
-                    'channel_map': ':'.join(f'{b:02X}' for b in channel_map),
-                    'hop': hop,
-                    'sca': sca,
-                    'rfu': rfu
-                }
-                idx += 18
-            
-            # Parse TxPower (1 byte) if present
-            if parsed['tx_power_present'] and idx < len(ext_hdr_bytes):
-                tx_power = ext_hdr_bytes[idx]
-                # TxPower is signed 8-bit value
-                if tx_power > 127:
-                    tx_power = tx_power - 256
-                parsed['tx_power'] = tx_power
-                idx += 1
-        
-        return parsed
+        Returns:
+            dict: Parsed payload fields
+        """
+        return adv_parser.parse_adv_payload(pdu_type, payload_bytes)
 
     def show_byte(self, frame: AnalyzerFrame, tmo):
         """
@@ -470,7 +327,7 @@ class Hla(HighLevelAnalyzer):
         end_time_f = frame.end_time
         if tmo == 1:
             # Use expected bit duration for timeout cases
-            delta_time = SaleaeTimeDelta(microsecond=bit_rate_time[self.rate])
+            delta_time = SaleaeTimeDelta(microsecond=BIT_RATE_TIME[self.rate])
             end_time_f = frame.start_time + delta_time
         
         if show_frame == 1:
@@ -478,9 +335,21 @@ class Hla(HighLevelAnalyzer):
             if self.analyze_st == "WAIT_PLD" or self.analyze_st == "WAIT_CRC":
                 # Create frame for payload or CRC data
                 pld_hex = list(map(hex, self.pld))
-                new_frame = AnalyzerFrame(frame_type, self.pld_frame_start_time, end_time_f, {
+                frame_data = {
                     'data': str(pld_hex)
-                })
+                }
+                
+                # Parse payload according to BLE 4.2 spec if PDU type is known and we're in ADV mode
+                # Only parse when payload is complete (frame_type is 'pld' and all payload bytes received)
+                if (self.my_choices_setting == "ADV" and self.pdu_type and 
+                    frame_type == 'pld' and len(self.pld) > 0):
+                    # frame_len_remain == 0 means all payload bytes have been received
+                    # (it was decremented after adding the last byte to self.pld)
+                    if self.frame_len_remain == 0:
+                        payload_parsed = self.parse_adv_payload(self.pdu_type, self.pld)
+                        frame_data.update(payload_parsed)
+                
+                new_frame = AnalyzerFrame(frame_type, self.pld_frame_start_time, end_time_f, frame_data)
                 # Clear payload buffer and reset frame length
                 self.pld.clear()
                 self.frame_len = 0

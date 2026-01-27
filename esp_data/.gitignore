@@ -1,0 +1,5 @@
+# Python bytecode
+*.pyc
+parsers/__pycache__/
+parsers/*.pyc
+__pycache__/
