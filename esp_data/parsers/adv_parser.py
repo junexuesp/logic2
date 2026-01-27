@@ -128,11 +128,9 @@ def parse_extended_header(ext_hdr_bytes):
             cte_length = cte_info_byte & 0x1F  # Bits 0-4
             cte_rfu = (cte_info_byte >> 5) & 0x1  # Bit 5
             cte_type = (cte_info_byte >> 6) & 0x3  # Bits 6-7
-            parsed['cte_info'] = {
-                'cte_length': cte_length,
-                'cte_rfu': cte_rfu,
-                'cte_type': cte_type
-            }
+            parsed['cte_length'] = cte_length
+            parsed['cte_rfu'] = cte_rfu
+            parsed['cte_type'] = cte_type
             idx += 1
         
         # Parse ADI (2 bytes) if present
@@ -150,11 +148,9 @@ def parse_extended_header(ext_hdr_bytes):
             channel_idx = aux_ptr[0]
             ca = aux_ptr[1]
             offset = aux_ptr[2]
-            parsed['aux_ptr'] = {
-                'channel_idx': channel_idx,
-                'ca': ca,
-                'offset': offset
-            }
+            parsed['aux_ptr_channel_idx'] = channel_idx
+            parsed['aux_ptr_ca'] = ca
+            parsed['aux_ptr_offset'] = offset
             idx += 3
         
         # Parse SyncInfo (18 bytes) if present
@@ -175,17 +171,15 @@ def parse_extended_header(ext_hdr_bytes):
             sca = (hop_byte >> 3) & 0x7
             rfu = (hop_byte >> 6) & 0x3
             
-            parsed['sync_info'] = {
-                'access_addr': ':'.join(f'{b:02X}' for b in reversed(access_addr)),
-                'crc_init': ':'.join(f'{b:02X}' for b in reversed(crc_init)),
-                'win_offset': win_offset,
-                'win_size': win_size,
-                'interval': interval,
-                'channel_map': ':'.join(f'{b:02X}' for b in channel_map),
-                'hop': hop,
-                'sca': sca,
-                'rfu': rfu
-            }
+            parsed['sync_info_access_addr'] = ':'.join(f'{b:02X}' for b in reversed(access_addr))
+            parsed['sync_info_crc_init'] = ':'.join(f'{b:02X}' for b in reversed(crc_init))
+            parsed['sync_info_win_offset'] = win_offset
+            parsed['sync_info_win_size'] = win_size
+            parsed['sync_info_interval'] = interval
+            parsed['sync_info_channel_map'] = ':'.join(f'{b:02X}' for b in channel_map)
+            parsed['sync_info_hop'] = hop
+            parsed['sync_info_sca'] = sca
+            parsed['sync_info_rfu'] = rfu
             idx += 18
         
         # Parse TxPower (1 byte) if present
@@ -210,7 +204,7 @@ def parse_adv_payload(pdu_type, payload_bytes):
     - ADV_NONCONN_IND: AdvA (6 bytes) + AdvData (0-31 bytes)
     - ADV_SCAN_IND: AdvA (6 bytes) + AdvData (0-31 bytes)
     - SCAN_REQ: ScanA (6 bytes) + AdvA (6 bytes)
-    - SCAN_RSP: AdvData (0-31 bytes)
+    - SCAN_RSP: AdvA (6 bytes) + AdvData (0-31 bytes)
     - CONN_IND: InitA (6 bytes) + AdvA (6 bytes) + LLData (22 bytes)
     
     Args:
@@ -221,7 +215,6 @@ def parse_adv_payload(pdu_type, payload_bytes):
         dict: Parsed payload fields
     """
     parsed = {}
-    parsed['raw_data'] = list(map(hex, payload_bytes))
     
     if not payload_bytes:
         return parsed
@@ -237,8 +230,9 @@ def parse_adv_payload(pdu_type, payload_bytes):
         if len(payload_bytes) >= 6:
             adv_a_bytes = payload_bytes[0:6]
             parsed['adv_a'] = format_mac_addr(adv_a_bytes)
-            parsed['adv_data'] = payload_bytes[6:] if len(payload_bytes) > 6 else []
-            parsed['adv_data_hex'] = list(map(hex, parsed['adv_data']))
+            if len(payload_bytes) > 6:
+                adv_data_bytes = payload_bytes[6:]
+                parsed['adv_data_hex'] = str(list(map(hex, adv_data_bytes)))
     
     elif pdu_type == 'ADV_DIR_IND' or pdu_type == 'ADV_DIR':
         # ADV_DIR_IND: AdvA (6 bytes) + TargetA (6 bytes)
@@ -254,16 +248,18 @@ def parse_adv_payload(pdu_type, payload_bytes):
         if len(payload_bytes) >= 6:
             adv_a_bytes = payload_bytes[0:6]
             parsed['adv_a'] = format_mac_addr(adv_a_bytes)
-            parsed['adv_data'] = payload_bytes[6:] if len(payload_bytes) > 6 else []
-            parsed['adv_data_hex'] = list(map(hex, parsed['adv_data']))
+            if len(payload_bytes) > 6:
+                adv_data_bytes = payload_bytes[6:]
+                parsed['adv_data_hex'] = str(list(map(hex, adv_data_bytes)))
     
     elif pdu_type == 'ADV_SCAN_IND' or pdu_type == 'SCAN_IND':
         # ADV_SCAN_IND/SCAN_IND: AdvA (6 bytes) + AdvData (0-31 bytes)
         if len(payload_bytes) >= 6:
             adv_a_bytes = payload_bytes[0:6]
             parsed['adv_a'] = format_mac_addr(adv_a_bytes)
-            parsed['adv_data'] = payload_bytes[6:] if len(payload_bytes) > 6 else []
-            parsed['adv_data_hex'] = list(map(hex, parsed['adv_data']))
+            if len(payload_bytes) > 6:
+                adv_data_bytes = payload_bytes[6:]
+                parsed['adv_data_hex'] = str(list(map(hex, adv_data_bytes)))
     
     elif pdu_type == 'SCAN_REQ':
         # SCAN_REQ: ScanA (6 bytes) + AdvA (6 bytes)
@@ -275,9 +271,13 @@ def parse_adv_payload(pdu_type, payload_bytes):
             parsed['adv_a'] = format_mac_addr(adv_a_bytes)
     
     elif pdu_type == 'SCAN_RSP':
-        # SCAN_RSP: AdvData (0-31 bytes)
-        parsed['adv_data'] = payload_bytes
-        parsed['adv_data_hex'] = list(map(hex, payload_bytes))
+        # SCAN_RSP: AdvA (6 bytes) + AdvData (0-31 bytes)
+        if len(payload_bytes) >= 6:
+            adv_a_bytes = payload_bytes[0:6]
+            parsed['adv_a'] = format_mac_addr(adv_a_bytes)
+            if len(payload_bytes) > 6:
+                adv_data_bytes = payload_bytes[6:]
+                parsed['adv_data_hex'] = str(list(map(hex, adv_data_bytes)))
     
     elif pdu_type == 'CONN_IND':
         # CONN_IND: InitA (6 bytes) + AdvA (6 bytes) + LLData (22 bytes)
@@ -289,23 +289,20 @@ def parse_adv_payload(pdu_type, payload_bytes):
             parsed['adv_a'] = format_mac_addr(adv_a_bytes)
         if len(payload_bytes) >= 34:
             ll_data_bytes = payload_bytes[12:34]
-            parsed['ll_data'] = ll_data_bytes
-            parsed['ll_data_hex'] = list(map(hex, ll_data_bytes))
+            parsed['ll_data_hex'] = str(list(map(hex, ll_data_bytes)))
             # Parse LLData fields (BLE 4.2 spec)
             # LLData: AA (4) + CRCInit (3) + WinSize (1) + WinOffset (2) + 
             #         Interval (2) + Latency (2) + Timeout (2) + ChM (5) + Hop (1)
             if len(ll_data_bytes) >= 22:
-                parsed['ll_data_parsed'] = {
-                    'access_addr': ':'.join(f'{b:02X}' for b in reversed(ll_data_bytes[0:4])),
-                    'crc_init': ':'.join(f'{b:02X}' for b in reversed(ll_data_bytes[4:7])),
-                    'win_size': ll_data_bytes[7],
-                    'win_offset': ll_data_bytes[8] | (ll_data_bytes[9] << 8),
-                    'interval': ll_data_bytes[10] | (ll_data_bytes[11] << 8),
-                    'latency': ll_data_bytes[12] | (ll_data_bytes[13] << 8),
-                    'timeout': ll_data_bytes[14] | (ll_data_bytes[15] << 8),
-                    'channel_map': ':'.join(f'{b:02X}' for b in ll_data_bytes[16:21]),
-                    'hop': ll_data_bytes[21] & 0x1F,
-                    'sca': (ll_data_bytes[21] >> 5) & 0x7
-                }
+                parsed['ll_data_access_addr'] = ':'.join(f'{b:02X}' for b in reversed(ll_data_bytes[0:4]))
+                parsed['ll_data_crc_init'] = ':'.join(f'{b:02X}' for b in reversed(ll_data_bytes[4:7]))
+                parsed['ll_data_win_size'] = ll_data_bytes[7]
+                parsed['ll_data_win_offset'] = ll_data_bytes[8] | (ll_data_bytes[9] << 8)
+                parsed['ll_data_interval'] = ll_data_bytes[10] | (ll_data_bytes[11] << 8)
+                parsed['ll_data_latency'] = ll_data_bytes[12] | (ll_data_bytes[13] << 8)
+                parsed['ll_data_timeout'] = ll_data_bytes[14] | (ll_data_bytes[15] << 8)
+                parsed['ll_data_channel_map'] = ':'.join(f'{b:02X}' for b in ll_data_bytes[16:21])
+                parsed['ll_data_hop'] = ll_data_bytes[21] & 0x1F
+                parsed['ll_data_sca'] = (ll_data_bytes[21] >> 5) & 0x7
     
     return parsed

@@ -289,6 +289,7 @@ class Hla(HighLevelAnalyzer):
                     self.pld_frame_start_time = self.frame_start_time
                 self.frame_len_remain -= 1
                 # Show frame when all bytes received or on timeout
+                # On timeout, always show what we have collected so far
                 if self.frame_len_remain == 0 or tmo == 1:
                     show_frame = 1
                 else:
@@ -298,8 +299,10 @@ class Hla(HighLevelAnalyzer):
                     self.frame_start_time = 0
                     return None
             else:
+                # frame_len == 0 case (shouldn't happen normally, but handle it)
                 show_frame = 1
-                self.pld_frame_start_time = self.frame_start_time
+                if len(self.pld) == 1:  # First byte in this case
+                    self.pld_frame_start_time = self.frame_start_time
         elif self.analyze_st == "WAIT_EXT_HDR":
             # Collect extended header bytes
             if self.ext_hdr_remain == self.ext_hdr_len:
@@ -311,6 +314,7 @@ class Hla(HighLevelAnalyzer):
             self.ext_hdr_remain -= 1
             self.frame_len_remain -= 1
             # Show frame when all extended header bytes received or on timeout
+            # On timeout, always show what we have collected so far
             if self.ext_hdr_remain == 0 or tmo == 1:
                 show_frame = 1
             else:
@@ -321,7 +325,13 @@ class Hla(HighLevelAnalyzer):
                 return None
         else:
             # S0, LEN, or CEAP: show immediately
+            # These are single-byte fields, so they're always complete when we reach here
             show_frame = 1
+            # If timeout occurred, mark as potentially incomplete (though for single bytes this is rare)
+            if tmo == 1:
+                # For single-byte fields, timeout usually means the byte was forced to complete
+                # but we can still mark it if needed
+                pass
         
         # Calculate end time (adjust for timeout if needed)
         end_time_f = frame.end_time
@@ -339,12 +349,19 @@ class Hla(HighLevelAnalyzer):
                     'data': str(pld_hex)
                 }
                 
+                # Mark as incomplete if timeout occurred and data is not complete
+                if tmo == 1 and self.frame_len_remain > 0:
+                    frame_data['incomplete'] = True
+                    frame_data['expected_bytes'] = self.frame_len
+                    frame_data['received_bytes'] = len(self.pld)
+                
                 # Parse payload according to BLE 4.2 spec if PDU type is known and we're in ADV mode
                 # Only parse when payload is complete (frame_type is 'pld' and all payload bytes received)
                 if (self.my_choices_setting == "ADV" and self.pdu_type and 
                     frame_type == 'pld' and len(self.pld) > 0):
                     # frame_len_remain == 0 means all payload bytes have been received
                     # (it was decremented after adding the last byte to self.pld)
+                    # Only parse if payload is complete (not timed out or all bytes received)
                     if self.frame_len_remain == 0:
                         payload_parsed = self.parse_adv_payload(self.pdu_type, self.pld)
                         frame_data.update(payload_parsed)
@@ -355,7 +372,7 @@ class Hla(HighLevelAnalyzer):
                 self.frame_len = 0
                 self.frame_len_remain = 0
             elif self.analyze_st == "WAIT_EXT_HDR":
-                # Parse extended header fields
+                # Parse extended header fields (even if incomplete due to timeout)
                 ext_hdr_parsed = self.parse_extended_header(self.ext_hdr_data)
                 # Create frame for extended header data with parsed fields
                 ext_hdr_hex = list(map(hex, self.ext_hdr_data))
@@ -363,6 +380,11 @@ class Hla(HighLevelAnalyzer):
                     'data': str(ext_hdr_hex),
                     'ext_hdr': True
                 }
+                # Mark as incomplete if timeout occurred and extended header is not complete
+                if tmo == 1 and self.ext_hdr_remain > 0:
+                    frame_data['incomplete'] = True
+                    frame_data['expected_bytes'] = self.ext_hdr_len
+                    frame_data['received_bytes'] = len(self.ext_hdr_data)
                 # Add parsed fields to frame data
                 frame_data.update(ext_hdr_parsed)
                 new_frame = AnalyzerFrame(frame_type, self.pld_frame_start_time, end_time_f, frame_data)
