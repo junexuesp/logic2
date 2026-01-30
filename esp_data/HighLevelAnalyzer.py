@@ -50,6 +50,7 @@ class Hla(HighLevelAnalyzer):
         self.ext_hdr_data = []  # Extended header data buffer
         self.ext_hdr_flags = 0  # Extended header flags
         self.ext_hdr_parsed = False  # Whether extended header has been parsed
+        self.last_bit_end_time = 0  # End time of previous bit (for gap-based timeout, e.g. CRC after PLD stop)
 
         print("Settings:", self.my_string_setting,
               self.my_number_setting, self.my_choices_setting, self.frame_start_time)
@@ -134,15 +135,15 @@ class Hla(HighLevelAnalyzer):
         - < 2000ns: 125Kbps (rate=3)
         - >= 2000ns: 500Kbps (rate=2)
         
-        Also detects bit timing errors:
-        - Error type 1: Bit duration > 8000ns (too long)
+        Also detects bit timing errors and gap timeout:
+        - Error type 1: Bit duration or gap > one byte time at current bit rate (timeout)
         - Error type 2: Bit duration < 200ns and not the last bit (too short)
         
         Args:
             frame: Input analyzer frame containing bit data
         """
         delta_st = self.delta_to_ns(frame.end_time, frame.start_time)
-        # Initialize the frame start time and detect bit rate on first bit
+        # Initialize the frame start time and detect bit rate on first bit (needed for byte_time_ns)
         if self.frame_start_time == 0:
             self.frame_start_time = frame.start_time
             # Detect bit rate based on bit duration (in nanoseconds)
@@ -154,10 +155,18 @@ class Hla(HighLevelAnalyzer):
                 self.rate = 3  # 125Kbps
             else:
                 self.rate = 2  # 500Kbps
-        
-        # Detect bit duration errors
-        if delta_st > 8000:
-            # Error type 1: Bit duration too long (possible frame gap or error)
+        # One byte time at current bit rate (ns): 8 bits * BIT_RATE_TIME[rate] µs/bit
+        byte_time_ns = int(8 * BIT_RATE_TIME[self.rate] * 1000)
+        # Gap-based timeout: after PLD we enter WAIT_CRC; if no data for > one byte time, reset to WAIT_S0.
+        # When the next bit arrives, gap from last bit (e.g. last PLD bit) > byte_time_ns → timeout.
+        if self.last_bit_end_time != 0:
+            gap_ns = self.delta_to_ns(frame.start_time, self.last_bit_end_time)
+            if gap_ns > byte_time_ns:
+                self.bit_time_error = 1  # Will call show_byte(1) and reset to WAIT_S0
+        self.last_bit_end_time = frame.end_time
+        # Detect bit duration errors (only if gap didn't already set timeout)
+        if self.bit_time_error != 1 and delta_st > byte_time_ns:
+            # Error type 1: Current bit duration > one byte time (gap or error)
             self.bit_time_error = 1
         elif delta_st < 200 and self.count != 7:
             # Error type 2: Bit duration too short (except for the last bit)
@@ -279,14 +288,52 @@ class Hla(HighLevelAnalyzer):
         show_frame = 0
         new_frame = None
         
+        # WAIT_CRC timeout: after PLD, if no data for > one byte time → reset to WAIT_S0 (gap > byte_time_ns in decode sets tmo=1)
+        if self.analyze_st == "WAIT_CRC" and len(self.pld) == 0:
+            if tmo == 1:
+                # Timeout: current bit belongs to next packet. Output incomplete CRC (0 bytes), reset to WAIT_S0, keep byte/count so next packet's first byte aligns.
+                end_time_f = frame.start_time + SaleaeTimeDelta(microsecond=BIT_RATE_TIME[self.rate])
+                frame_data = {'data': '[]', 'incomplete': True, 'expected_bytes': 3, 'received_bytes': 0}
+                new_frame = AnalyzerFrame('crc', self.pld_frame_start_time, end_time_f, frame_data)
+                self.pld.clear()
+                self.frame_len = 0
+                self.frame_len_remain = 0
+                self.analyze_st = "WAIT_S0"
+                self.pdu_type = None
+                self.ext_hdr_len = 0
+                self.ext_hdr_remain = 0
+                self.ext_hdr_data = []
+                self.ext_hdr_flags = 0
+                self.ext_hdr_parsed = False
+                self.last_bit_end_time = 0
+                # Do NOT reset self.byte, self.count - next bits complete the first byte of next packet
+                return new_frame
+            else:
+                # Full byte received - this is S0 of next packet (no CRC was sent). Output S0 frame.
+                end_time_f = frame.end_time
+                new_frame = AnalyzerFrame('s0', self.frame_start_time, end_time_f, {'data': "byte"})
+                self.set_s0_fields(new_frame)
+                new_frame.data['data'] = byte_data
+                self.pld.clear()
+                self.frame_len = 0
+                self.frame_len_remain = 0
+                self.analyze_st = "WAIT_S0"
+                self.analyze_state_change()  # WAIT_S0 -> WAIT_LEN
+                self.byte = 0
+                self.count = 0
+                self.frame_start_time = 0
+                return new_frame
+        
         if self.analyze_st == "WAIT_PLD" or self.analyze_st == "WAIT_CRC":
-            # Collect payload or CRC bytes
+            # Collect payload or CRC bytes (CRC: 3 bytes; timeout if gap > one byte time at current bit rate)
+            # Track payload frame start time (first byte of actual payload data).
+            # For EXT_ADV we come from WAIT_EXT_HDR so frame_len_remain != frame_len;
+            # use "first byte in pld for this section" (len(pld)==0) so pld begin time
+            # is after the previous ext_hdr frame and Logic 2 validation passes.
+            if len(self.pld) == 0:
+                self.pld_frame_start_time = self.frame_start_time
             self.pld.append(self.byte)
             if self.frame_len != 0:
-                # Track payload frame start time (first byte of actual payload data)
-                # For EXT_ADV, this is after CEAP and extended header
-                if self.frame_len_remain == self.frame_len:
-                    self.pld_frame_start_time = self.frame_start_time
                 self.frame_len_remain -= 1
                 # Show frame when all bytes received or on timeout
                 # On timeout, always show what we have collected so far
@@ -301,8 +348,6 @@ class Hla(HighLevelAnalyzer):
             else:
                 # frame_len == 0 case (shouldn't happen normally, but handle it)
                 show_frame = 1
-                if len(self.pld) == 1:  # First byte in this case
-                    self.pld_frame_start_time = self.frame_start_time
         elif self.analyze_st == "WAIT_EXT_HDR":
             # Collect extended header bytes
             if self.ext_hdr_remain == self.ext_hdr_len:
@@ -413,7 +458,7 @@ class Hla(HighLevelAnalyzer):
         self.count = 0
         self.frame_start_time = 0
         
-        # Reset to initial state on timeout
+        # Reset to WAIT_S0 on timeout: after PLD→WAIT_CRC, no data for > one byte time → state machine reset to WAIT_S0
         if tmo == 1:
             self.analyze_st = "WAIT_S0"
             self.pdu_type = None
@@ -422,6 +467,7 @@ class Hla(HighLevelAnalyzer):
             self.ext_hdr_data = []
             self.ext_hdr_flags = 0
             self.ext_hdr_parsed = False
+            self.last_bit_end_time = 0  # So next packet doesn't falsely trigger gap timeout
         
         return new_frame
 
