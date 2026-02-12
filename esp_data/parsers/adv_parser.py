@@ -280,7 +280,7 @@ def parse_adv_payload(pdu_type, payload_bytes):
                 parsed['adv_data'] = str(list(map(hex, adv_data_bytes)))
     
     elif pdu_type == 'CONN_IND':
-        # CONN_IND: InitA (6 bytes) + AdvA (6 bytes) + LLData (22 bytes)
+        # CONN_IND (connection request): InitA (6) + AdvA (6) + LLData (22); full parse below
         if len(payload_bytes) >= 6:
             init_a_bytes = payload_bytes[0:6]
             parsed['init_a'] = format_mac_addr(init_a_bytes)
