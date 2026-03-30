@@ -75,8 +75,9 @@ def parse_extended_header(ext_hdr_bytes):
     - AdvA (6 bytes): Advertiser's address (if Flags bit 0 set)
     - TargetA (6 bytes): Target address (if Flags bit 1 set)
     - CTEInfo (1 byte): Constant Tone Extension Info (if Flags bit 2 set)
-    - ADI (2 bytes): Advertising Data Indication (if Flags bit 3 set)
-    - AuxPtr (3 bytes): Auxiliary Pointer (if Flags bit 4 set)
+    - ADI (2 bytes, LE): DID 12 bits (bits 0-11), SID 4 bits (bits 12-15)
+    - AuxPtr (3 bytes, LE): Ch.Index 6b, CA 1b, Offset Unit 1b, Aux Offset 13b, Aux PHY 3b;
+      time offset (µs) = Aux Offset × (30 if unit==0 else 300)
     - SyncInfo (18 bytes): Synchronization Info (if Flags bit 5 set)
     - TxPower (1 byte): Transmit Power (if Flags bit 6 set)
     
@@ -133,24 +134,36 @@ def parse_extended_header(ext_hdr_bytes):
             parsed['cte_type'] = cte_type
             idx += 1
         
-        # Parse ADI (2 bytes) if present
+        # Parse ADI (2 bytes) if present — Core Spec Vol 6 Part B (Advertising Data Info)
         if parsed['ADI'] and idx + 2 <= len(ext_hdr_bytes):
             adi_bytes = ext_hdr_bytes[idx:idx+2]
-            # ADI: Advertising Data Indication (2 bytes)
-            adi = adi_bytes[0] | (adi_bytes[1] << 8)
+            adi = adi_bytes[0] | (adi_bytes[1] << 8)  # little-endian
             parsed['adi'] = adi
+            parsed['did'] = adi & 0x0FFF  # 12 bits: Advertising Data ID
+            parsed['sid'] = (adi >> 12) & 0x0F  # 4 bits: Advertising Set ID
             idx += 2
         
-        # Parse AuxPtr (3 bytes) if present
+        # Parse AuxPtr (3 bytes) if present — Core Spec Vol 6 Part B
         if parsed['AuxPtr'] and idx + 3 <= len(ext_hdr_bytes):
-            aux_ptr = ext_hdr_bytes[idx:idx+3]
-            # AuxPtr: Channel Index (1 byte) + CA (1 byte) + Offset (1 byte)
-            channel_idx = aux_ptr[0]
-            ca = aux_ptr[1]
-            offset = aux_ptr[2]
-            parsed['aux_ch'] = channel_idx
+            b0, b1, b2 = (
+                ext_hdr_bytes[idx],
+                ext_hdr_bytes[idx + 1],
+                ext_hdr_bytes[idx + 2],
+            )
+            v = b0 | (b1 << 8) | (b2 << 16)
+            aux_ch = v & 0x3F  # bits 0-5: channel index
+            ca = (v >> 6) & 0x1  # bit 6: clock accuracy (0=51–500ppm, 1=0–50ppm)
+            offset_unit = (v >> 7) & 0x1  # bit 7: 0 → 30µs, 1 → 300µs per offset step
+            aux_off_raw = (v >> 8) & 0x1FFF  # bits 8-20: auxiliary offset
+            aux_phy = (v >> 21) & 0x07  # bits 21-23: PHY for aux packet
+            unit_us = 300 if offset_unit else 30
+            aux_off_us = aux_off_raw * unit_us
+            parsed['aux_ch'] = aux_ch
             parsed['aux_ca'] = ca
-            parsed['aux_off'] = offset
+            parsed['aux_offset_unit'] = offset_unit
+            parsed['aux_off_raw'] = aux_off_raw
+            parsed['aux_phy'] = aux_phy
+            parsed['aux_off'] = aux_off_us  # microseconds from reference to aux PDU start
             idx += 3
         
         # Parse SyncInfo (18 bytes) if present
