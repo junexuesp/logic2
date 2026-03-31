@@ -224,7 +224,8 @@ def parse_adv_payload(pdu_type, payload_bytes):
     - ADV_SCAN_IND: AdvA (6 bytes) + AdvData (0-31 bytes)
     - SCAN_REQ: ScanA (6 bytes) + AdvA (6 bytes)
     - SCAN_RSP: AdvA (6 bytes) + AdvData (0-31 bytes)
-    - CONN_IND: InitA (6 bytes) + AdvA (6 bytes) + LLData (22 bytes)
+    - CONN_IND: InitA (6) + AdvA (6) + LLData (22); ll_win_sz/ll_win_off/ll_iv in 1.25 ms units;
+      ll_tmo in 10 ms units; last octet = Hop (bits 0-4) + SCA (bits 5-7).
     
     Args:
         pdu_type: PDU type string (e.g., 'ADV_IND', 'SCAN_REQ')
@@ -299,29 +300,37 @@ def parse_adv_payload(pdu_type, payload_bytes):
                 parsed['adv_data'] = str(list(map(hex, adv_data_bytes)))
     
     elif pdu_type == 'CONN_IND':
-        # CONN_IND (connection request): InitA (6) + AdvA (6) + LLData (22); full parse below
+        # CONNECT_IND (Vol 6 Part B): InitA (6) + AdvA (6) + LLData (22), all addrs LE on air.
         if len(payload_bytes) >= 6:
             init_a_bytes = payload_bytes[0:6]
             parsed['init_a'] = format_mac_addr(init_a_bytes)
         if len(payload_bytes) >= 12:
             adv_a_bytes = payload_bytes[6:12]
             parsed['adv_a'] = format_mac_addr(adv_a_bytes)
-        if len(payload_bytes) >= 34:
-            ll_data_bytes = payload_bytes[12:34]
-            parsed['ll_data'] = str(list(map(hex, ll_data_bytes)))
-            # Parse LLData fields (BLE 4.2 spec)
-            # LLData: AA (4) + CRCInit (3) + WinSize (1) + WinOffset (2) + 
-            #         Interval (2) + Latency (2) + Timeout (2) + ChM (5) + Hop (1)
+        if len(payload_bytes) > 12:
+            ll_data_bytes = payload_bytes[12:34]  # fixed 22 B for full PDU; slice caps long buffers
+            # LLData layout: AA(4)+CRCInit(3)+WinSize(1)+WinOffset(2)+Interval(2)+Latency(2)+
+            #                Timeout(2)+ChM(5)+Hop/SCA(1). Multi-octet fields LE.
+            # Units: WinSize/WinOffset/Interval counts are ×1.25 ms; Timeout ×10 ms; Latency = events.
             if len(ll_data_bytes) >= 22:
-                parsed['ll_aa'] = ':'.join(f'{b:02X}' for b in reversed(ll_data_bytes[0:4]))
-                parsed['ll_crc'] = ':'.join(f'{b:02X}' for b in reversed(ll_data_bytes[4:7]))
+                ll_data_bytes = ll_data_bytes[:22]
+                parsed['ll_aa'] = ':'.join(
+                    f'{b:02X}' for b in reversed(ll_data_bytes[0:4])
+                )
+                parsed['ll_crc'] = ':'.join(
+                    f'{b:02X}' for b in reversed(ll_data_bytes[4:7])
+                )
                 parsed['ll_win_sz'] = ll_data_bytes[7]
                 parsed['ll_win_off'] = ll_data_bytes[8] | (ll_data_bytes[9] << 8)
                 parsed['ll_iv'] = ll_data_bytes[10] | (ll_data_bytes[11] << 8)
                 parsed['ll_lat'] = ll_data_bytes[12] | (ll_data_bytes[13] << 8)
                 parsed['ll_tmo'] = ll_data_bytes[14] | (ll_data_bytes[15] << 8)
-                parsed['ll_chm'] = ':'.join(f'{b:02X}' for b in ll_data_bytes[16:21])
+                parsed['ll_chm'] = ':'.join(
+                    f'{b:02X}' for b in ll_data_bytes[16:21]
+                )
                 parsed['ll_hop'] = ll_data_bytes[21] & 0x1F
                 parsed['ll_sca'] = (ll_data_bytes[21] >> 5) & 0x7
+            else:
+                parsed['ll_data'] = str(list(map(hex, ll_data_bytes)))
     
     return parsed
