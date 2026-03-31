@@ -283,21 +283,6 @@ class Hla(HighLevelAnalyzer):
         """
         return adv_parser.parse_extended_header(ext_hdr_bytes)
 
-    def parse_adv_payload(self, pdu_type, payload_bytes):
-        """
-        Parse BLE 4.2 advertising packet payload according to PDU type.
-        
-        Delegates to adv_parser module.
-        
-        Args:
-            pdu_type: PDU type string (e.g., 'ADV_IND', 'SCAN_REQ')
-            payload_bytes: List of payload bytes
-            
-        Returns:
-            dict: Parsed payload fields
-        """
-        return adv_parser.parse_adv_payload(pdu_type, payload_bytes)
-
     def show_byte(self, frame: AnalyzerFrame, tmo):
         """
         Create and return an output frame for the current byte.
@@ -397,17 +382,7 @@ class Hla(HighLevelAnalyzer):
                     frame_data['expected_bytes'] = self.frame_len
                     frame_data['received_bytes'] = len(self.pld)
                 
-                # Parse payload according to BLE 4.2 spec if PDU type is known and we're in ADV mode
-                # Only parse when payload is complete (frame_type is 'pld' and all payload bytes received)
-                if (self.my_choices_setting == "ADV" and self.pdu_type and 
-                    frame_type == 'pld' and len(self.pld) > 0):
-                    # frame_len_remain == 0 means all payload bytes have been received
-                    # (it was decremented after adding the last byte to self.pld)
-                    # Only parse if payload is complete (not timed out or all bytes received)
-                    if self.frame_len_remain == 0:
-                        payload_parsed = self.parse_adv_payload(self.pdu_type, self.pld)
-                        frame_data['pdu_type'] = self.pdu_type
-                        frame_data.update(payload_parsed)
+                # PLD/CRC bubbles: raw byte list only (no pdu_type / structured parse)
                 
                 new_frame = AnalyzerFrame(frame_type, self.pld_frame_start_time, end_time_f, frame_data)
                 # Clear payload buffer and reset frame length
@@ -417,18 +392,15 @@ class Hla(HighLevelAnalyzer):
             elif self.analyze_st == "WAIT_EXT_HDR":
                 # Parse extended header fields (even if incomplete due to timeout)
                 ext_hdr_parsed = self.parse_extended_header(self.ext_hdr_data)
-                # Create frame for extended header data with parsed fields
-                ext_hdr_hex = list(map(hex, self.ext_hdr_data))
-                frame_data = {
-                    'data': str(ext_hdr_hex),
-                    'ext_hdr': True
-                }
-                # Mark as incomplete if timeout occurred and extended header is not complete
-                if tmo == 1 and self.ext_hdr_remain > 0:
+                frame_data = {}
+                incomplete = tmo == 1 and self.ext_hdr_remain > 0
+                if incomplete:
                     frame_data['incomplete'] = True
                     frame_data['expected_bytes'] = self.ext_hdr_len
                     frame_data['received_bytes'] = len(self.ext_hdr_data)
-                # Add parsed fields to frame data
+                    frame_data['raw_hex'] = ' '.join(
+                        f'{b:02X}' for b in self.ext_hdr_data
+                    )
                 frame_data.update(ext_hdr_parsed)
                 new_frame = AnalyzerFrame(frame_type, self.pld_frame_start_time, end_time_f, frame_data)
                 # Clear extended header from payload buffer

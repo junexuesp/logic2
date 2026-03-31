@@ -76,8 +76,8 @@ def parse_extended_header(ext_hdr_bytes):
     - TargetA (6 bytes): Target address (if Flags bit 1 set)
     - CTEInfo (1 byte): Constant Tone Extension Info (if Flags bit 2 set)
     - ADI (2 bytes, LE): DID 12 bits (bits 0-11), SID 4 bits (bits 12-15)
-    - AuxPtr (3 bytes, LE): Ch.Index 6b, CA 1b, Offset Unit 1b, Aux Offset 13b, Aux PHY 3b;
-      time offset (µs) = Aux Offset × (30 if unit==0 else 300)
+    - AuxPtr (3 bytes, LE): Ch.Index 6b, CA 1b, aux_offset_unit 1b, Aux Offset 13b, Aux PHY 3b;
+      outputs aux_offset_unit (0|1), aux_off (µs) = raw_13b × (30 if unit==0 else 300)
     - SyncInfo (18 bytes): Synchronization Info (if Flags bit 5 set)
     - TxPower (1 byte): Transmit Power (if Flags bit 6 set)
     
@@ -138,7 +138,6 @@ def parse_extended_header(ext_hdr_bytes):
         if parsed['ADI'] and idx + 2 <= len(ext_hdr_bytes):
             adi_bytes = ext_hdr_bytes[idx:idx+2]
             adi = adi_bytes[0] | (adi_bytes[1] << 8)  # little-endian
-            parsed['adi'] = adi
             parsed['did'] = adi & 0x0FFF  # 12 bits: Advertising Data ID
             parsed['sid'] = (adi >> 12) & 0x0F  # 4 bits: Advertising Set ID
             idx += 2
@@ -160,10 +159,10 @@ def parse_extended_header(ext_hdr_bytes):
             aux_off_us = aux_off_raw * unit_us
             parsed['aux_ch'] = aux_ch
             parsed['aux_ca'] = ca
+            # Protocol bit: 0 → 30µs per Aux Offset step, 1 → 300µs per step
             parsed['aux_offset_unit'] = offset_unit
-            parsed['aux_off_raw'] = aux_off_raw
             parsed['aux_phy'] = aux_phy
-            parsed['aux_off'] = aux_off_us  # microseconds from reference to aux PDU start
+            parsed['aux_off'] = aux_off_us  # µs (= raw 13b × 30 or ×300 per aux_offset_unit)
             idx += 3
         
         # Parse SyncInfo (18 bytes) if present
@@ -203,7 +202,14 @@ def parse_extended_header(ext_hdr_bytes):
                 tx_power = tx_power - 256
             parsed['tx_power'] = tx_power
             idx += 1
-    
+
+    # Strip display-only noise (flags byte + substantive fields are enough for the Logic bubble)
+    for _k in (
+        'AdvA', 'TgtA', 'CTE', 'ADI', 'AuxPtr', 'SyncInfo', 'TxPwr', 'rfu',
+        'cte_rfu',
+    ):
+        parsed.pop(_k, None)
+
     return parsed
 
 
