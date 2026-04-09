@@ -372,18 +372,28 @@ class Hla(HighLevelAnalyzer):
             if self.analyze_st == "WAIT_PLD" or self.analyze_st == "WAIT_CRC":
                 # Create frame for payload or CRC data
                 pld_hex = list(map(hex, self.pld))
-                frame_data = {
-                    'data': str(pld_hex)
-                }
-                
-                # Mark as incomplete if timeout occurred and data is not complete
-                if tmo == 1 and self.frame_len_remain > 0:
+                incomplete = tmo == 1 and self.frame_len_remain > 0
+
+                parsed_adv = {}
+                if (
+                    self.my_choices_setting == "ADV"
+                    and self.analyze_st == "WAIT_PLD"
+                    and self.pdu_type is not None
+                ):
+                    parsed_adv = adv_parser.parse_adv_payload(self.pdu_type, self.pld)
+
+                # Structured fields first; append raw bytes as `pld_raw` (not `data`, so the bubble still shows parsed keys).
+                if parsed_adv:
+                    frame_data = dict(parsed_adv)
+                    frame_data['pld_raw'] = str(pld_hex)
+                else:
+                    frame_data = {'data': str(pld_hex)}
+
+                if incomplete:
                     frame_data['incomplete'] = True
                     frame_data['expected_bytes'] = self.frame_len
                     frame_data['received_bytes'] = len(self.pld)
-                
-                # PLD/CRC bubbles: raw byte list only (no pdu_type / structured parse)
-                
+
                 new_frame = AnalyzerFrame(frame_type, self.pld_frame_start_time, end_time_f, frame_data)
                 # Clear payload buffer and reset frame length
                 self.pld.clear()
