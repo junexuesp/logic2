@@ -9,23 +9,23 @@ from constants import PDU_TYPE, EXT_ADV_MODE
 
 def parse_s0_adv(byte_value):
     """
-    Parse S0 byte for ADV link type.
-    
-    Args:
-        byte_value: The S0 byte value
-        
-    Returns:
-        dict: Parsed fields and PDU type
+    Parse first advertising PDU header octet.
+
+    PDU Type uses bits 0–3 (four bits). Bits 4–7: RFU / ChSel / TxAdd / RxAdd (layout varies by PDU).
     """
-    pdu_type_idx = byte_value & 0x7  # Bits 0-2: PDU Type
-    pdu_type = PDU_TYPE[pdu_type_idx]
-    
+    pdu_type_idx = byte_value & 0x0F
+    pdu_type = (
+        PDU_TYPE[pdu_type_idx]
+        if pdu_type_idx < len(PDU_TYPE)
+        else f'RSVD_0x{pdu_type_idx:X}'
+    )
+
     return {
         'pdu_type': pdu_type,
-        'rfu': (byte_value >> 4) & 1,  # Bit 4: Reserved for Future Use
-        'chsel': (byte_value >> 5) & 1,  # Bit 5: Channel Selection
-        'TxAdd': (byte_value >> 6) & 1,  # Bit 6: Transmit Address
-        'RxAdd': (byte_value >> 7) & 1,  # Bit 7: Receive Address
+        'rfu': (byte_value >> 4) & 1,
+        'chsel': (byte_value >> 5) & 1,
+        'TxAdd': (byte_value >> 6) & 1,
+        'RxAdd': (byte_value >> 7) & 1,
     }
 
 

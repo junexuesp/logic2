@@ -1,7 +1,32 @@
 # BLE constants and type definitions (abbreviated for Logic 2 display)
 
-# BLE PDU types for advertising channels
-PDU_TYPE = ['ADV_IND', 'ADV_DIR', 'NON_CONN', 'SCAN_REQ', 'SCAN_RSP', 'CONN_IND', 'SCAN_IND', 'EXT_ADV', 'AUX_CONN_RSP']
+# Advertising PDU Type = low nibble of first header octet (Vol 6 Part B Table 2.3, Core 5.4+ /6.x).
+# Wireshark packet-btle.c: 0x8 = AUX_CONNECT_RSP (0b1000),0x9 = ADV_DECISION_IND.
+PDU_TYPE = [
+    'ADV_IND',            # 0x0
+    'ADV_DIR',            # 0x1 ADV_DIRECT_IND
+    'NON_CONN',           # 0x2 ADV_NONCONN_IND
+    'SCAN_REQ',           # 0x3
+    'SCAN_RSP',           # 0x4
+    'CONN_IND',           # 0x5 (secondary: AUX_CONNECT_REQ)
+    'SCAN_IND',           # 0x6 ADV_SCAN_IND
+    'EXT_ADV',            # 0x7 ADV_EXT_IND / AUX common extended on secondary
+    'AUX_CONN_RSP',       # 0x8 AUX_CONNECT_RSP
+    'ADV_DECISION_IND',   # 0x9
+    'RSVD_0xA',
+    'RSVD_0xB',
+    'RSVD_0xC',
+    'RSVD_0xD',
+    'RSVD_0xE',
+    'RSVD_0xF',
+]
+
+# Payload begins with Common Extended Advertising Payload (ExtHdrLen + AdvMode + …)
+ADV_PDU_USES_CEAP = frozenset({
+    'EXT_ADV',
+    'AUX_CONN_RSP',
+    'ADV_DECISION_IND',
+})
 
 # ACL Link Layer ID: RFU, Empty/Continue, Start, Control
 ACL_LLID_TYPE = ['RFU', 'CONT', 'START', 'CTRL']

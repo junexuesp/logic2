@@ -7,7 +7,7 @@ from saleae.analyzers import HighLevelAnalyzer, AnalyzerFrame, StringSetting, Nu
 from saleae.data import SaleaeTimeDelta
 
 # Import constants and parsers
-from constants import PDU_TYPE, BIT_RATE_TIME, GAP_TIMEOUT_CRC_BYTE_MULTIPLIER
+from constants import ADV_PDU_USES_CEAP, BIT_RATE_TIME, GAP_TIMEOUT_CRC_BYTE_MULTIPLIER, PDU_TYPE
 from parsers import adv_parser, acl_parser, cis_parser, bis_parser
 # High level analyzers must subclass the HighLevelAnalyzer class.
 class Hla(HighLevelAnalyzer):
@@ -44,7 +44,7 @@ class Hla(HighLevelAnalyzer):
         self.frame_len = 0  # Total length of payload
         self.frame_len_remain = 0  # Remaining bytes to receive
         self.pld = []  # Payload data buffer
-        self.pdu_type = None  # Current PDU type (for EXT_ADV detection)
+        self.pdu_type = None  # Current PDU type (for CEAP / payload routing)
         self.ext_hdr_len = 0  # Extended header length for EXT_ADV
         self.ext_hdr_remain = 0  # Remaining extended header bytes
         self.ext_hdr_data = []  # Extended header data buffer
@@ -95,8 +95,7 @@ class Hla(HighLevelAnalyzer):
                 self.frame_len = 3
                 self.frame_len_remain = 3
                 self.analyze_st = "WAIT_CRC"
-            elif self.pdu_type == "EXT_ADV":
-                # EXT_ADV requires parsing Common Extended Advertising Payload first
+            elif self.pdu_type in ADV_PDU_USES_CEAP:
                 self.analyze_st = "WAIT_CEAP"
             else:
                 self.analyze_st = "WAIT_PLD"
@@ -245,8 +244,13 @@ class Hla(HighLevelAnalyzer):
         elif self.my_choices_setting == "ADV":
             parsed = adv_parser.parse_s0_adv(self.byte)
             new_frame.data.update(parsed)
-            # Save PDU type for EXT_ADV special handling
-            self.pdu_type = parsed['pdu_type']
+            # PDU type must use low nibble (4 bits). Single source of truth — avoids stale parser / &0x7 bug.
+            _idx = self.byte & 0x0F
+            self.pdu_type = (
+                PDU_TYPE[_idx] if _idx < len(PDU_TYPE) else f'RSVD_0x{_idx:X}'
+            )
+            new_frame.data['pdu_type'] = self.pdu_type
+            new_frame.data['pdu_type_id'] = _idx
         else:  # BIS
             parsed = bis_parser.parse_s0_bis(self.byte)
             new_frame.data.update(parsed)
