@@ -14,7 +14,7 @@ class Hla(HighLevelAnalyzer):
     # List of settings that a user can set for this High Level Analyzer.
     my_string_setting = StringSetting()
     my_number_setting = NumberSetting(min_value=0, max_value=255)
-    my_choices_setting = ChoicesSetting(choices=("ACL", "CIS", "BIS", "ADV"))
+    my_choices_setting = ChoicesSetting(choices=("ACL", "CIS", "BIS", "ADV", "2p4g"))
 
     # An optional list of types this analyzer produces, providing a way to customize the way frames are displayed in Logic 2.
     result_types = {
@@ -51,6 +51,9 @@ class Hla(HighLevelAnalyzer):
         self.ext_hdr_flags = 0  # Extended header flags
         self.ext_hdr_parsed = False  # Whether extended header has been parsed
         self.last_bit_end_time = 0  # End time of previous bit (for gap-based timeout, e.g. CRC after PLD stop)
+        self.last_output_end_time = None  # End time of previous output frame (for strict frame ordering)
+        self.pid = 0  # 2p4g packet id (2 bits)
+        self.no_ack = 0  # 2p4g no_ack flag (1 bit)
 
         print("Settings:", self.my_string_setting,
               self.my_number_setting, self.my_choices_setting, self.frame_start_time)
@@ -85,6 +88,32 @@ class Hla(HighLevelAnalyzer):
         - WAIT_PLD -> WAIT_CRC: After receiving all payload bytes
         - WAIT_CRC -> WAIT_S0: After receiving CRC, ready for next frame
         """
+        if self.my_choices_setting == "2p4g":
+            if self.analyze_st == "WAIT_S0":
+                self.analyze_st = "WAIT_LEN"
+            elif self.analyze_st == "WAIT_LEN":
+                # 2p4g LEN byte format: [pid:2 bits][length:6 bits]
+                self.frame_len = self.byte & 0x3F
+                self.frame_len_remain = self.frame_len
+                self.pid = (self.byte >> 6) & 0x03
+                self.analyze_st = "WAIT_NO_ACK"
+            elif self.analyze_st == "WAIT_NO_ACK":
+                if self.frame_len == 0:
+                    self.frame_len = 2
+                    self.frame_len_remain = 2
+                    self.analyze_st = "WAIT_CRC"
+                else:
+                    self.analyze_st = "WAIT_PLD"
+            elif self.analyze_st == "WAIT_PLD":
+                self.frame_len = 2
+                self.frame_len_remain = 2
+                self.analyze_st = "WAIT_CRC"
+            elif self.analyze_st == "WAIT_CRC":
+                self.analyze_st = "WAIT_S0"
+            else:
+                self.analyze_st = "WAIT_S0"
+            return
+
         if self.analyze_st == "WAIT_S0":
             self.analyze_st = "WAIT_LEN"
         elif self.analyze_st == "WAIT_LEN":
@@ -136,6 +165,8 @@ class Hla(HighLevelAnalyzer):
         self.ext_hdr_data = []
         self.ext_hdr_flags = 0
         self.ext_hdr_parsed = False
+        self.pid = 0
+        self.no_ack = 0
         if clear_byte_assembly:
             self.byte = 0
             self.count = 0
@@ -169,7 +200,10 @@ class Hla(HighLevelAnalyzer):
             # byte_time: 8 bits at current rate; BIT_RATE_TIME is per-bit in microseconds
             byte_time_us = 8 * BIT_RATE_TIME[self.rate]
             byte_time_ns = int(byte_time_us * 1000)
-            if self.analyze_st == "WAIT_CRC":
+            if self.my_choices_setting == "2p4g" and self.analyze_st == "WAIT_NO_ACK":
+                # 2p4g no_ack is 1 bit, so use 1-bit timeout threshold.
+                threshold_ns = int(BIT_RATE_TIME[self.rate] * 1000)
+            elif self.analyze_st == "WAIT_CRC":
                 threshold_ns = GAP_TIMEOUT_CRC_BYTE_MULTIPLIER * byte_time_ns
             else:
                 threshold_ns = byte_time_ns  # 1 byte time for other states
@@ -217,6 +251,8 @@ class Hla(HighLevelAnalyzer):
             frame_type = 'ceap'
         elif self.analyze_st == "WAIT_EXT_HDR":
             frame_type = 'ext_hdr'
+        elif self.analyze_st == "WAIT_NO_ACK":
+            frame_type = 'no_ack'
         elif self.analyze_st == "WAIT_PLD":
             frame_type = 'pld'
         else:
@@ -286,6 +322,28 @@ class Hla(HighLevelAnalyzer):
             dict: Parsed extended header fields
         """
         return adv_parser.parse_extended_header(ext_hdr_bytes)
+
+    def create_output_frame(self, frame_type, start_time, end_time, data):
+        """
+        Create an AnalyzerFrame while enforcing strict monotonic frame times.
+        Logic 2 requires each frame begin time to be strictly after the previous frame end time.
+        """
+        # Use a tiny delta based on current bit time, with a minimum to avoid zero-duration shifts.
+        min_delta_us = max(BIT_RATE_TIME[self.rate] / 16, 0.001)
+        min_delta = SaleaeTimeDelta(microsecond=min_delta_us)
+
+        safe_start = start_time
+        safe_end = end_time
+
+        if self.last_output_end_time is not None and safe_start <= self.last_output_end_time:
+            safe_start = self.last_output_end_time + min_delta
+
+        if safe_end <= safe_start:
+            safe_end = safe_start + min_delta
+
+        out = AnalyzerFrame(frame_type, safe_start, safe_end, data)
+        self.last_output_end_time = safe_end
+        return out
 
     def show_byte(self, frame: AnalyzerFrame, tmo):
         """
@@ -370,6 +428,11 @@ class Hla(HighLevelAnalyzer):
             # Use expected bit duration for timeout cases
             delta_time = SaleaeTimeDelta(microsecond=BIT_RATE_TIME[self.rate])
             end_time_f = frame.start_time + delta_time
+        elif self.my_choices_setting == "2p4g" and self.analyze_st == "WAIT_NO_ACK":
+            # Keep no_ack frame end slightly before the next payload bit start.
+            # This avoids Logic 2 "begin must start after previous frame" validation failures.
+            half_bit_time = SaleaeTimeDelta(microsecond=BIT_RATE_TIME[self.rate] / 2)
+            end_time_f = frame.start_time + half_bit_time
         
         if show_frame == 1:
             frame_type = self.get_frame_type()
@@ -390,6 +453,14 @@ class Hla(HighLevelAnalyzer):
                 if parsed_adv:
                     frame_data = dict(parsed_adv)
                     frame_data['pld_raw'] = str(pld_hex)
+                elif self.my_choices_setting == "2p4g" and self.analyze_st == "WAIT_PLD":
+                    frame_data = {
+                        'payload': str(pld_hex),
+                        'pid': self.pid,
+                        'no_ack': self.no_ack,
+                    }
+                elif self.my_choices_setting == "2p4g" and self.analyze_st == "WAIT_CRC":
+                    frame_data = {'crc': str(pld_hex)}
                 else:
                     frame_data = {'data': str(pld_hex)}
 
@@ -398,7 +469,9 @@ class Hla(HighLevelAnalyzer):
                     frame_data['expected_bytes'] = self.frame_len
                     frame_data['received_bytes'] = len(self.pld)
 
-                new_frame = AnalyzerFrame(frame_type, self.pld_frame_start_time, end_time_f, frame_data)
+                new_frame = self.create_output_frame(
+                    frame_type, self.pld_frame_start_time, end_time_f, frame_data
+                )
                 # Clear payload buffer and reset frame length
                 self.pld.clear()
                 self.frame_len = 0
@@ -416,22 +489,48 @@ class Hla(HighLevelAnalyzer):
                         f'{b:02X}' for b in self.ext_hdr_data
                     )
                 frame_data.update(ext_hdr_parsed)
-                new_frame = AnalyzerFrame(frame_type, self.pld_frame_start_time, end_time_f, frame_data)
+                if 'flags' in frame_data and isinstance(frame_data['flags'], int):
+                    frame_data['flags'] = f'0x{frame_data["flags"]:02X}'
+                if 'did' in frame_data and isinstance(frame_data['did'], int):
+                    frame_data['did'] = f'0x{frame_data["did"]:03X}'
+                new_frame = self.create_output_frame(
+                    frame_type, self.pld_frame_start_time, end_time_f, frame_data
+                )
                 # Clear extended header from payload buffer
                 self.pld.clear()
                 self.ext_hdr_data = []
                 self.ext_hdr_parsed = True
             else:
                 # Create frame for S0, LEN, or CEAP byte
-                new_frame = AnalyzerFrame(frame_type, self.frame_start_time, end_time_f, {
+                new_frame = self.create_output_frame(frame_type, self.frame_start_time, end_time_f, {
                     'data': "byte"
                 })
                 if self.analyze_st == "WAIT_S0":
                     # Parse S0 fields based on link type
                     self.set_s0_fields(new_frame)
+                elif self.analyze_st == "WAIT_LEN" and self.my_choices_setting == "2p4g":
+                    new_frame.data['length'] = self.byte & 0x3F
+                    new_frame.data['pid'] = (self.byte >> 6) & 0x03
+                elif self.analyze_st == "WAIT_NO_ACK" and self.my_choices_setting == "2p4g":
+                    new_frame.data['no_ack'] = self.byte & 0x01
                 elif self.analyze_st == "WAIT_CEAP":
                     # Parse CEAP header fields for EXT_ADV
                     self.set_ceap_fields(new_frame)
+                if tmo == 1 and self.my_choices_setting == "2p4g":
+                    if self.analyze_st == "WAIT_LEN":
+                        expected_bits = 8
+                        received_bits = self.count
+                        if received_bits < expected_bits:
+                            new_frame.data['incomplete'] = True
+                            new_frame.data['expected_bits'] = expected_bits
+                            new_frame.data['received_bits'] = received_bits
+                    elif self.analyze_st == "WAIT_NO_ACK":
+                        expected_bits = 1
+                        received_bits = self.count
+                        if received_bits < expected_bits:
+                            new_frame.data['incomplete'] = True
+                            new_frame.data['expected_bits'] = expected_bits
+                            new_frame.data['received_bits'] = received_bits
                 new_frame.data['data'] = byte_data
             
             # Update state machine to next state
@@ -466,6 +565,26 @@ class Hla(HighLevelAnalyzer):
         """
         # Process frame state (detect bit rate, timing errors)
         self.process_state(frame)
+
+        # 2p4g packet starts with LEN/PID byte (no S0 field).
+        if self.my_choices_setting == "2p4g" and self.analyze_st == "WAIT_S0":
+            self.analyze_st = "WAIT_LEN"
+
+        # 2p4g format contains a 1-bit no_ack field between LEN and payload.
+        if self.my_choices_setting == "2p4g" and self.analyze_st == "WAIT_NO_ACK":
+            data = frame.data['data']
+            if self.bit_time_error == 1:
+                self.byte = data & 0x01
+                self.count = 1
+                self.no_ack = self.byte
+                return self.show_byte(frame, 1)
+            elif self.bit_time_error == 2:
+                return None
+
+            self.byte = data & 0x01
+            self.count = 1
+            self.no_ack = self.byte
+            return self.show_byte(frame, 0)
 
         # Get the bit data from the input frame
         data = frame.data['data']
