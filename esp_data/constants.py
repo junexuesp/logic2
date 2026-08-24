@@ -45,3 +45,15 @@ GAP_TIMEOUT_CRC_BYTE_MULTIPLIER = 3
 
 # Extended Adv Mode (CEAP): 0b00 NC+NS, 0b01 C+NS, 0b10 NC+S, 0b11 RFU
 EXT_ADV_MODE = ['NC_NS', 'C_NS', 'NC_S', 'RFU']
+
+# BLE 6.0 Channel Sounding (Vol 6 Part H) — CS_SYNC field lengths in bits
+CS_PREAMBLE_LEN_1M = 8
+CS_PREAMBLE_LEN_2M = 16
+CS_AA_LEN = 32
+CS_TRAILER_LEN = 4
+CS_SOUNDING_LENS = (32, 96)
+CS_RANDOM_LENS = (32, 64, 96, 128)
+CS_MARKER_PATTERNS = ((1, 1, 0, 0), (0, 0, 1, 1))
+
+# Minimum tone gap to emit a cs_tone frame (microseconds)
+CS_TONE_MIN_US = 4

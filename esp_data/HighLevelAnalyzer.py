@@ -7,20 +7,33 @@ from saleae.analyzers import HighLevelAnalyzer, AnalyzerFrame, StringSetting, Nu
 from saleae.data import SaleaeTimeDelta
 
 # Import constants and parsers
-from constants import ADV_PDU_USES_CEAP, BIT_RATE_TIME, GAP_TIMEOUT_CRC_BYTE_MULTIPLIER, PDU_TYPE
-from parsers import adv_parser, acl_parser, cis_parser, bis_parser
+from constants import (
+    ADV_PDU_USES_CEAP,
+    BIT_RATE_TIME,
+    CS_TONE_MIN_US,
+    GAP_TIMEOUT_CRC_BYTE_MULTIPLIER,
+    PDU_TYPE,
+)
+from parsers import adv_parser, acl_parser, cis_parser, bis_parser, cs_parser
 # High level analyzers must subclass the HighLevelAnalyzer class.
 class Hla(HighLevelAnalyzer):
     # List of settings that a user can set for this High Level Analyzer.
     my_string_setting = StringSetting()
     my_number_setting = NumberSetting(min_value=0, max_value=255)
-    my_choices_setting = ChoicesSetting(choices=("ACL", "CIS", "BIS", "ADV", "2p4g"))
+    my_choices_setting = ChoicesSetting(choices=("ACL", "CIS", "BIS", "ADV", "2p4g", "CS"))
 
-    # An optional list of types this analyzer produces, providing a way to customize the way frames are displayed in Logic 2.
+    # Display formats for Logic 2 bubbles. Without these, all data keys are jammed together.
+    # Only CS frames use custom formats; other link types keep the previous default display.
     result_types = {
         'mytype': {
             'format': 'Output type: {{type}}, Input type: {{data.input_type}}'
-        }
+        },
+        'cs_sync': {
+            'format': '{{data.summary}}'
+        },
+        'cs_tone': {
+            'format': 'CS_TONE {{data.duration_us}} us'
+        },
     }
 
     def __init__(self):
@@ -55,6 +68,11 @@ class Hla(HighLevelAnalyzer):
         self.last_output_end_time = None  # End time of previous output frame (for strict frame ordering)
         self.pid = 0  # 2p4g packet id (2 bits)
         self.no_ack = 0  # 2p4g no_ack flag (1 bit)
+        # Channel Sounding (BLE 6.0) bit-level collection
+        self.cs_bits = []  # Bits collected for current CS_SYNC
+        self.cs_packet_start_time = 0  # Start of current CS_SYNC
+        self.cs_sync_end_time = None  # End time of last bit in finalized CS_SYNC (gap timeout)
+        self.cs_tone_start_time = None  # Start of unmodulated CS tone window
 
         print("Settings:", self.my_string_setting,
               self.my_number_setting, self.my_choices_setting, self.frame_start_time)
@@ -165,7 +183,10 @@ class Hla(HighLevelAnalyzer):
         Reset state machine to WAIT_S0.
         Used on timeout (gap or bit duration) to sync for next packet.
         """
-        self.analyze_st = "WAIT_S0"
+        if self.my_choices_setting == "CS":
+            self.analyze_st = "CS_WAIT"
+        else:
+            self.analyze_st = "WAIT_S0"
         self.pdu_type = None
         self.ext_hdr_len = 0
         self.ext_hdr_remain = 0
@@ -176,6 +197,9 @@ class Hla(HighLevelAnalyzer):
         self.pid = 0
         self.no_ack = 0
         if clear_byte_assembly:
+            self.cs_bits.clear()
+            self.cs_packet_start_time = 0
+            self.cs_tone_start_time = None
             self.byte = 0
             self.count = 0
             self.frame_start_time = 0
@@ -211,12 +235,19 @@ class Hla(HighLevelAnalyzer):
             if self.my_choices_setting == "2p4g" and self.analyze_st == "WAIT_NO_ACK":
                 # 2p4g no_ack is 1 bit, so use 1-bit timeout threshold.
                 threshold_ns = int(BIT_RATE_TIME[self.rate] * 1000)
+            elif self.my_choices_setting == "CS" and self.analyze_st == "CS_COLLECT":
+                # End CS_SYNC on inter-bit gap > ~2 bit times (last RS bit often
+                # needs timeout; 1 bit time was too tight and truncated early).
+                threshold_ns = int(2.5 * BIT_RATE_TIME[self.rate] * 1000)
             elif self.analyze_st == "WAIT_CRC":
                 threshold_ns = GAP_TIMEOUT_CRC_BYTE_MULTIPLIER * byte_time_ns
             else:
                 threshold_ns = byte_time_ns  # 1 byte time for other states
             if gap_ns > threshold_ns:
-                self.reset_to_wait_s0(clear_byte_assembly=(self.count > 0))
+                if self.my_choices_setting == "CS":
+                    self._cs_on_gap_timeout(frame, gap_ns)
+                else:
+                    self.reset_to_wait_s0(clear_byte_assembly=(self.count > 0))
                 self.last_bit_end_time = 0  # Will be set at end after processing this bit
 
         delta_st = self.delta_to_ns(frame.end_time, frame.start_time)
@@ -588,6 +619,186 @@ class Hla(HighLevelAnalyzer):
         
         return new_frame
 
+    def _cs_reset_collect(self):
+        """Clear CS_SYNC bit collection state."""
+        self.cs_bits.clear()
+        self.cs_packet_start_time = 0
+
+    def _cs_start_tone_window(self, start_time):
+        """Mark the beginning of a potential CS tone (unmodulated) period."""
+        if self.cs_tone_start_time is None:
+            self.cs_tone_start_time = start_time
+
+    def _cs_packet_complete(self, total_bits):
+        """
+        Check if sequence-only CS_SYNC bit count is complete.
+
+        Complete lengths:
+        - random/sounding sequence only: 32/64/96/128 bits
+        """
+        return total_bits in (32, 64, 96, 128)
+
+    def _cs_emit_tone_frame(self, end_time):
+        """
+        Emit a CS_TONE frame if a tone window was open long enough.
+
+        Returns:
+            AnalyzerFrame or None
+        """
+        if self.cs_tone_start_time is None:
+            return None
+
+        duration_us = self.delta_to_ns(end_time, self.cs_tone_start_time) / 1000.0
+        if duration_us < CS_TONE_MIN_US:
+            self.cs_tone_start_time = None
+            return None
+
+        frame_data = cs_parser.build_tone_frame_data(duration_us)
+        out = self.create_output_frame(
+            'cs_tone',
+            self.cs_tone_start_time,
+            end_time,
+            frame_data,
+        )
+        self.cs_tone_start_time = None
+        return out
+
+    def _cs_finalize_sync(self, frame, tmo=0):
+        """
+        Parse collected CS_SYNC bits and emit an output frame.
+
+        Returns:
+            AnalyzerFrame or None
+        """
+        if not self.cs_bits:
+            self.analyze_st = "CS_WAIT"
+            self._cs_reset_collect()
+            return None
+
+        parsed = cs_parser.parse_cs_sync_bits(
+            self.cs_bits,
+            self.rate,
+            incomplete=(tmo == 1),
+        )
+        # Safety: force sequence-only CS view in HLA even if an old cached cs_parser
+        # still returns legacy fields.
+        for legacy_key in (
+            'access_address', 'aa_msb', 'preamble', 'preamble_len',
+            'trailer', 'trailer_ok', 'trailer_expected',
+        ):
+            if legacy_key in parsed:
+                parsed.pop(legacy_key, None)
+        # Rebuild summary from sequence only.
+        summary_parts = [
+            'CS_SYNC',
+            parsed.get('phy', 'LE_1M'),
+        ]
+        seq_type = parsed.get('sequence_type', 'none')
+        if seq_type == 'sounding':
+            summary_parts.append(
+                f"SS[{parsed.get('sounding_len', len(parsed.get('sounding_sequence', '').replace(' ', '')))}]={parsed.get('sounding_sequence', '')}"
+            )
+        elif seq_type == 'random':
+            summary_parts.append(
+                f"RS[{parsed.get('random_len', len(parsed.get('random_sequence', '').replace(' ', '')))}]={parsed.get('random_sequence', '')}"
+            )
+        else:
+            summary_parts.append('seq=none')
+        if parsed.get('incomplete'):
+            summary_parts.append('incomplete')
+        parsed['summary'] = ' | '.join(summary_parts)
+        start_time = self.cs_packet_start_time
+        if start_time == 0:
+            start_time = frame.start_time
+
+        if tmo == 1 and self.cs_sync_end_time is not None:
+            end_time = self.cs_sync_end_time
+        elif tmo == 1 and self.last_bit_end_time != 0:
+            end_time = self.last_bit_end_time
+        else:
+            end_time = frame.end_time
+            if tmo == 1:
+                bit_us = BIT_RATE_TIME[self.rate]
+                end_time = frame.start_time + SaleaeTimeDelta(microsecond=bit_us)
+
+        out = self.create_output_frame('cs_sync', start_time, end_time, parsed)
+
+        sync_end = end_time
+        self.analyze_st = "CS_WAIT"
+        self._cs_reset_collect()
+        self.cs_sync_end_time = None
+        # After sync, the following unmodulated period may be a CS tone (extended packet).
+        self._cs_start_tone_window(sync_end)
+        return out
+
+    def _cs_on_gap_timeout(self, frame, gap_ns):
+        """Handle inter-packet gap while in CS mode."""
+        if self.analyze_st == "CS_COLLECT" and self.cs_bits:
+            self.cs_sync_end_time = self.last_bit_end_time
+            self.analyze_st = "CS_WAIT"
+            return
+
+        if self.analyze_st == "CS_WAIT" and self.last_bit_end_time != 0:
+            self._cs_start_tone_window(self.last_bit_end_time)
+
+        self.analyze_st = "CS_WAIT"
+
+    def decode_cs(self, frame: AnalyzerFrame):
+        """
+        Decode BLE 6.0 Channel Sounding bit stream.
+
+        Input bits are sequence-only (no AA/trailer in this capture):
+          Sounding/Random sequence.
+        CS_TONE: unmodulated carrier between sync packets (extended CS step formats).
+        """
+        if self.analyze_st == "WAIT_S0":
+            self.analyze_st = "CS_WAIT"
+
+        sync_to_emit = None
+        # Gap detected in process_state — finalize previous CS_SYNC without consuming this bit.
+        if self.analyze_st == "CS_WAIT" and self.cs_bits:
+            sync_to_emit = self._cs_finalize_sync(frame, tmo=1)
+
+        data = frame.data['data'] & 1
+
+        if self.bit_time_error == 2:
+            return sync_to_emit
+
+        if self.bit_time_error == 1:
+            # Stretched bit / end-of-packet timeout.
+            if self.analyze_st == "CS_COLLECT":
+                # If we already have a complete sequence, this long bit is
+                # past the packet — finalize without appending.
+                if self._cs_packet_complete(len(self.cs_bits)):
+                    out = self._cs_finalize_sync(frame, tmo=1)
+                    return out or sync_to_emit
+                # Otherwise this stretched bit is the last data bit (e.g. last RS bit).
+                self.cs_bits.append(data)
+                out = self._cs_finalize_sync(frame, tmo=1)
+                return out or sync_to_emit
+            tone = self._cs_emit_tone_frame(frame.start_time)
+            return tone or sync_to_emit
+
+        pending_tone = None
+        if self.analyze_st == "CS_WAIT":
+            pending_tone = self._cs_emit_tone_frame(frame.start_time)
+            self.analyze_st = "CS_COLLECT"
+            self.cs_packet_start_time = frame.start_time
+            self.cs_bits = []
+
+        self.cs_bits.append(data)
+
+        # After a full legal sequence length, wait for timeout/gap to end the
+        # packet (do not cut early at 32 when RS may be 64). Max RS is 128 —
+        # finalize immediately when that length is reached.
+        if len(self.cs_bits) >= 128:
+            out = self._cs_finalize_sync(frame, tmo=0)
+            return out or sync_to_emit
+
+        if sync_to_emit is not None:
+            return sync_to_emit
+        return pending_tone
+
     def decode(self, frame: AnalyzerFrame):
         """
         Process a frame from the input analyzer and decode BLE data.
@@ -605,6 +816,9 @@ class Hla(HighLevelAnalyzer):
         """
         # Process frame state (detect bit rate, timing errors)
         self.process_state(frame)
+
+        if self.my_choices_setting == "CS":
+            return self.decode_cs(frame)
 
         # 2p4g packet starts with LEN/PID byte (no S0 field).
         if self.my_choices_setting == "2p4g" and self.analyze_st == "WAIT_S0":
