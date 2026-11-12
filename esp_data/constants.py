@@ -21,7 +21,9 @@ PDU_TYPE = [
     'RSVD_0xF',
 ]
 
-# Payload begins with Common Extended Advertising Payload (ExtHdrLen + AdvMode + …)
+# PDUs routed through the extended-header state machine. EXT_ADV and
+# AUX_CONN_RSP start with ExtHdrLen + AdvMode; ADV_DECISION_IND instead starts
+# with Decision Type Flags (6 bits) + AdvMode (2 bits).
 ADV_PDU_USES_CEAP = frozenset({
     'EXT_ADV',
     'AUX_CONN_RSP',

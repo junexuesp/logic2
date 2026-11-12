@@ -58,6 +58,29 @@ def parse_ceap_fields(byte_value, frame_len_remain):
     return result, ext_hdr_len, new_frame_len_remain
 
 
+def parse_decision_header_fields(byte_value, frame_len_remain):
+    """
+    Parse the first ADV_DECISION_IND payload octet.
+
+    Unlike the Common Extended Advertising Payload header, this octet contains
+    Decision Type Flags in bits 0-5 and AdvMode in bits 6-7. The following
+    Extended Header has no explicit length; its length is derived from its
+    Extended Header Flags.
+    """
+    return {
+        'decision_type_flags': f'0x{byte_value & 0x3F:02X}',
+        'adv_mode': EXT_ADV_MODE[(byte_value >> 6) & 0x03],
+    }, byte_value & 0x3F, max(frame_len_remain - 1, 0)
+
+
+def extended_header_length_from_flags(flags):
+    """Return the encoded Extended Header length implied by its Flags octet."""
+    field_lengths = (6, 6, 1, 2, 3, 18, 1)
+    return 1 + sum(
+        length for bit, length in enumerate(field_lengths) if flags & (1 << bit)
+    )
+
+
 def parse_extended_header(ext_hdr_bytes):
     """
     Parse Extended Header fields based on flags (BLE 6.0 specification).
@@ -80,6 +103,7 @@ def parse_extended_header(ext_hdr_bytes):
       outputs aux_offset_unit (0|1), aux_off (µs) = raw_13b × (30 if unit==0 else 300)
     - SyncInfo (18 bytes): Synchronization Info (if Flags bit 5 set)
     - TxPower (1 byte): Transmit Power (if Flags bit 6 set)
+    - ACAD: Any bytes left in the extended header after the flagged fields
     
     Args:
         ext_hdr_bytes: List of bytes in the extended header
@@ -130,6 +154,7 @@ def parse_extended_header(ext_hdr_bytes):
             cte_rfu = (cte_info_byte >> 5) & 0x1  # Bit 5
             cte_type = (cte_info_byte >> 6) & 0x3  # Bits 6-7
             parsed['cte_length'] = cte_length
+            parsed['cte_time_us'] = cte_length * 8
             parsed['cte_rfu'] = cte_rfu
             parsed['cte_type'] = cte_type
             idx += 1
@@ -168,30 +193,34 @@ def parse_extended_header(ext_hdr_bytes):
         # Parse SyncInfo (18 bytes) if present
         if parsed['SyncInfo'] and idx + 18 <= len(ext_hdr_bytes):
             sync_info = ext_hdr_bytes[idx:idx+18]
-            # SyncInfo: Access Address (4 bytes) + CRCInit (3 bytes) + 
-            #          WinOffset (2 bytes) + WinSize (1 byte) + Interval (2 bytes) +
-            #          Channel Map (5 bytes) + Hop/SCA/RFU (1 byte)
-            access_addr = sync_info[0:4]
-            crc_init = sync_info[4:7]
-            win_offset = sync_info[7] | (sync_info[8] << 8)
-            win_size = sync_info[9]
-            interval = sync_info[10] | (sync_info[11] << 8)
-            channel_map = sync_info[12:17]
-            hop_byte = sync_info[17]
-            # Hop byte: Bits 0-2 = Hop, Bits 3-5 = SCA, Bits 6-7 = RFU
-            hop = hop_byte & 0x7
-            sca = (hop_byte >> 3) & 0x7
-            rfu = (hop_byte >> 6) & 0x3
-            
-            parsed['sync_aa'] = ':'.join(f'{b:02X}' for b in reversed(access_addr))
-            parsed['sync_crc'] = ':'.join(f'{b:02X}' for b in reversed(crc_init))
-            parsed['sync_win_off'] = win_offset
-            parsed['sync_win_sz'] = win_size
-            parsed['sync_iv'] = interval
-            parsed['sync_chm'] = ':'.join(f'{b:02X}' for b in channel_map)
-            parsed['sync_hop'] = hop
-            parsed['sync_sca'] = sca
-            parsed['sync_rfu'] = rfu
+            # Core Spec Vol 6 Part B, Common Extended Advertising Payload:
+            # SyncPacketOffset(2) + Interval(2) + ChM/SCA(5) + AA(4) +
+            # CRCInit(3) + EventCounter(2), all multi-octet values little-endian.
+            offset_field = sync_info[0] | (sync_info[1] << 8)
+            sync_offset = offset_field & 0x1FFF
+            offset_unit = (offset_field >> 13) & 0x1
+            offset_adjust = (offset_field >> 14) & 0x1
+            interval = sync_info[2] | (sync_info[3] << 8)
+            channel_map = sync_info[4:9]
+            access_addr = sync_info[9:13]
+            crc_init = sync_info[13:16]
+            event_counter = sync_info[16] | (sync_info[17] << 8)
+
+            parsed['sync_offset'] = sync_offset
+            parsed['sync_offset_unit'] = offset_unit
+            parsed['sync_offset_us'] = (
+                sync_offset * (300 if offset_unit else 30)
+                + (2457600 if offset_adjust else 0)
+            )
+            parsed['sync_offset_adjust'] = offset_adjust
+            parsed['sync_offset_rfu'] = (offset_field >> 15) & 0x1
+            parsed['sync_interval'] = interval
+            parsed['sync_interval_us'] = interval * 1250
+            parsed['sync_chm'] = ' '.join(f'{b:02X}' for b in channel_map)
+            parsed['sync_sca'] = (channel_map[4] >> 5) & 0x7
+            parsed['sync_aa'] = f'0x{int.from_bytes(access_addr, "little"):08X}'
+            parsed['sync_crc'] = f'0x{int.from_bytes(crc_init, "little"):06X}'
+            parsed['sync_event_counter'] = event_counter
             idx += 18
         
         # Parse TxPower (1 byte) if present
@@ -203,6 +232,11 @@ def parse_extended_header(ext_hdr_bytes):
             parsed['tx_power'] = tx_power
             idx += 1
 
+        # Bytes not consumed by fields selected in Flags are Additional
+        # Controller Advertising Data (ACAD), which is part of ExtHdrLen.
+        if idx < len(ext_hdr_bytes):
+            parsed['acad'] = ' '.join(f'{b:02X}' for b in ext_hdr_bytes[idx:])
+
     # Strip display-only noise (flags byte + substantive fields are enough for the Logic bubble)
     for _k in (
         'AdvA', 'TgtA', 'CTE', 'ADI', 'AuxPtr', 'SyncInfo', 'TxPwr', 'rfu',
@@ -213,7 +247,40 @@ def parse_extended_header(ext_hdr_bytes):
     return parsed
 
 
-def parse_adv_payload(pdu_type, payload_bytes):
+def parse_decision_data(decision_type_flags, payload_bytes):
+    """
+    Parse the ADV_DECISION_IND data following its Extended Header.
+
+    Decision Type Flags are carried in the low six bits of the first
+    ADV_DECISION_IND payload octet. Bit 0 selects the six-octet Resolvable Tag
+    (24-bit Hash followed by 24-bit Prand). Bytes after all selected standard
+    subfields are application-defined Arbitrary Data.
+    """
+    parsed = {}
+    flags = decision_type_flags & 0x3F
+    data = payload_bytes
+
+    idx = 0
+    if flags & 0x01:
+        tag = data[:6]
+        parsed['resolvable_tag'] = ' '.join(f'{b:02X}' for b in tag)
+        if len(tag) == 6:
+            parsed['tag_hash'] = f'0x{int.from_bytes(tag[0:3], "little"):06X}'
+            parsed['tag_prand'] = f'0x{int.from_bytes(tag[3:6], "little"):06X}'
+            idx = 6
+        else:
+            parsed['decision_data_incomplete'] = True
+            parsed['expected_tag_bytes'] = 6
+            parsed['received_tag_bytes'] = len(tag)
+            return parsed
+
+    if idx < len(data):
+        parsed['arbitrary_data'] = ' '.join(f'{b:02X}' for b in data[idx:])
+
+    return parsed
+
+
+def parse_adv_payload(pdu_type, payload_bytes, decision_type_flags=0):
     """
     Parse BLE 4.2 advertising packet payload according to PDU type.
     
@@ -332,5 +399,9 @@ def parse_adv_payload(pdu_type, payload_bytes):
                 parsed['ll_sca'] = (ll_data_bytes[21] >> 5) & 0x7
             else:
                 parsed['ll_data'] = str(list(map(hex, ll_data_bytes)))
+
+    elif pdu_type == 'ADV_DECISION_IND':
+        # The decision header and Extended Header have already been consumed.
+        parsed.update(parse_decision_data(decision_type_flags, payload_bytes))
     
     return parsed

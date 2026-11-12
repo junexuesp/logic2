@@ -50,6 +50,7 @@ class Hla(HighLevelAnalyzer):
         self.ext_hdr_data = []  # Extended header data buffer
         self.ext_hdr_flags = 0  # Extended header flags
         self.ext_hdr_parsed = False  # Whether extended header has been parsed
+        self.decision_type_flags = 0  # ADV_DECISION_IND payload bits 0-5
         self.last_bit_end_time = 0  # End time of previous bit (for gap-based timeout, e.g. CRC after PLD stop)
         self.last_output_end_time = None  # End time of previous output frame (for strict frame ordering)
         self.pid = 0  # 2p4g packet id (2 bits)
@@ -78,10 +79,10 @@ class Hla(HighLevelAnalyzer):
         State transitions:
         - WAIT_S0 -> WAIT_LEN: After receiving frame header (S0)
         - WAIT_LEN -> WAIT_CEAP or WAIT_PLD or WAIT_CRC: After receiving length byte
-          - If EXT_ADV: go to WAIT_CEAP to parse Common Extended Advertising Payload
+          - For extended PDUs, parse the CEAP or ADV_DECISION_IND prefix
           - If length is 0, skip payload and go to WAIT_CRC
           - Otherwise: go to WAIT_PLD
-        - WAIT_CEAP -> WAIT_EXT_HDR or WAIT_PLD: After parsing CEAP header
+        - WAIT_CEAP -> WAIT_EXT_HDR or WAIT_PLD: After parsing the payload prefix
           - If Extended Header Length > 0: go to WAIT_EXT_HDR
           - Otherwise: go to WAIT_PLD
         - WAIT_EXT_HDR -> WAIT_PLD: After receiving all extended header bytes
@@ -129,7 +130,7 @@ class Hla(HighLevelAnalyzer):
             else:
                 self.analyze_st = "WAIT_PLD"
         elif self.analyze_st == "WAIT_CEAP":
-            # CEAP header parsed, check if extended header exists
+            # Payload prefix parsed, check if an extended header exists.
             if self.ext_hdr_len > 0:
                 self.ext_hdr_remain = self.ext_hdr_len
                 self.analyze_st = "WAIT_EXT_HDR"
@@ -138,7 +139,12 @@ class Hla(HighLevelAnalyzer):
                 self.analyze_st = "WAIT_PLD"
         elif self.analyze_st == "WAIT_EXT_HDR":
             # Extended header complete, now parse payload
-            self.analyze_st = "WAIT_PLD"
+            if self.frame_len_remain > 0:
+                self.analyze_st = "WAIT_PLD"
+            else:
+                self.frame_len = 3
+                self.frame_len_remain = 3
+                self.analyze_st = "WAIT_CRC"
         elif self.analyze_st == "WAIT_PLD":
             # Payload complete, now expect 3 bytes of CRC
             self.frame_len = 3
@@ -153,6 +159,7 @@ class Hla(HighLevelAnalyzer):
             self.ext_hdr_data = []
             self.ext_hdr_flags = 0
             self.ext_hdr_parsed = False
+            self.decision_type_flags = 0
     def reset_to_wait_s0(self, clear_byte_assembly=False):
         """
         Reset state machine to WAIT_S0.
@@ -165,6 +172,7 @@ class Hla(HighLevelAnalyzer):
         self.ext_hdr_data = []
         self.ext_hdr_flags = 0
         self.ext_hdr_parsed = False
+        self.decision_type_flags = 0
         self.pid = 0
         self.no_ack = 0
         if clear_byte_assembly:
@@ -248,7 +256,11 @@ class Hla(HighLevelAnalyzer):
         elif self.analyze_st == "WAIT_LEN":
             frame_type = 'len'
         elif self.analyze_st == "WAIT_CEAP":
-            frame_type = 'ceap'
+            frame_type = (
+                'decision_hdr'
+                if self.pdu_type == 'ADV_DECISION_IND'
+                else 'ceap'
+            )
         elif self.analyze_st == "WAIT_EXT_HDR":
             frame_type = 'ext_hdr'
         elif self.analyze_st == "WAIT_NO_ACK":
@@ -293,18 +305,33 @@ class Hla(HighLevelAnalyzer):
 
     def set_ceap_fields(self, new_frame: AnalyzerFrame):
         """
-        Parse and set Common Extended Advertising Payload (CEAP) header fields.
+        Parse the extended advertising payload-prefix fields.
         
-        The CEAP header (1 byte) contains:
+        A CEAP header contains:
         - Extended Header Length (6 bits, bits 0-5): Length of extended header (0-63 bytes)
         - AdvMode (2 bits, bits 6-7): Advertising mode
+
+        For ADV_DECISION_IND, bits 0-5 are Decision Type Flags instead of an
+        Extended Header Length. The following Extended Header Flags determine
+        that PDU's Extended Header length.
         
         Args:
             new_frame: AnalyzerFrame to populate with parsed fields
         """
-        parsed, ext_hdr_len, new_frame_len_remain = adv_parser.parse_ceap_fields(
-            self.byte, self.frame_len_remain
-        )
+        if self.pdu_type == 'ADV_DECISION_IND':
+            parsed, decision_type_flags, new_frame_len_remain = (
+                adv_parser.parse_decision_header_fields(
+                    self.byte, self.frame_len_remain
+                )
+            )
+            self.decision_type_flags = decision_type_flags
+            # ADV_DECISION_IND has no ExtHdrLen field. Start by collecting its
+            # Flags octet; that octet determines the complete header length.
+            ext_hdr_len = 1
+        else:
+            parsed, ext_hdr_len, new_frame_len_remain = adv_parser.parse_ceap_fields(
+                self.byte, self.frame_len_remain
+            )
         new_frame.data.update(parsed)
         self.ext_hdr_len = ext_hdr_len
         self.frame_len_remain = new_frame_len_remain
@@ -394,6 +421,15 @@ class Hla(HighLevelAnalyzer):
                 show_frame = 1
         elif self.analyze_st == "WAIT_EXT_HDR":
             # Collect extended header bytes
+            if (
+                self.pdu_type == 'ADV_DECISION_IND'
+                and not self.ext_hdr_data
+            ):
+                self.ext_hdr_flags = self.byte
+                self.ext_hdr_len = adv_parser.extended_header_length_from_flags(
+                    self.ext_hdr_flags
+                )
+                self.ext_hdr_remain = self.ext_hdr_len
             if self.ext_hdr_remain == self.ext_hdr_len:
                 # First byte of extended header, track start time
                 self.pld_frame_start_time = self.frame_start_time
@@ -447,7 +483,11 @@ class Hla(HighLevelAnalyzer):
                     and self.analyze_st == "WAIT_PLD"
                     and self.pdu_type is not None
                 ):
-                    parsed_adv = adv_parser.parse_adv_payload(self.pdu_type, self.pld)
+                    parsed_adv = adv_parser.parse_adv_payload(
+                        self.pdu_type,
+                        self.pld,
+                        self.decision_type_flags,
+                    )
 
                 # Structured fields first; append raw bytes as `pld_raw` (not `data`, so the bubble still shows parsed keys).
                 if parsed_adv:
